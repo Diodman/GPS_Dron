@@ -30,3 +30,4 @@ fiona==1.9.5
 munch==2.5.0
 packaging==23.1
 pyproj==3.6.0
+geopy==2.4.1
