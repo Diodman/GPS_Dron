@@ -9,9 +9,9 @@ from mapping_service import MappingService
 class ModernDroneRoutePlanner:
     def __init__(self, root):
         self.root = root
-        self.root.title("🚁 Планировщик маршрутов дронов")
-        self.root.geometry("1000x700")
-        self.root.configure(bg='#f0f0f0')
+        self.root.title("🚁 Advanced Drone Route Planner")
+        self.root.geometry("1400x900")
+        self.root.configure(bg='#f5f5f5')
         
         # Инициализация сервисов
         self.data_service = DataService()
@@ -25,96 +25,150 @@ class ModernDroneRoutePlanner:
         self.routing_service.add_progress_callback(self.update_progress)
         
         self.current_city = None
-        self.last_route = None
+        self.last_routes = []
+        self.drone_points = []
+        self.drone_types = []
         
         self.setup_ui()
     
     def setup_ui(self):
-        """Настройка современного интерфейса"""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="20")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Configure grid weights
+        # Configure main grid
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
         
-        # Header
-        header = ttk.Label(main_frame, text="🚁 Планировщик маршрутов дронов", 
-                          font=('Arial', 16, 'bold'), foreground='#2E7D32')
-        header.grid(row=0, column=0, columnspan=2, pady=(0, 20))
+        # Main notebook
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
         
-        # Input fields
-        ttk.Label(main_frame, text="🏙️ Город:", font=('Arial', 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.city_entry = ttk.Entry(main_frame, width=40, font=('Arial', 10))
-        self.city_entry.insert(0, "Berlin, Germany")
-        self.city_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
-        
-        ttk.Label(main_frame, text="📍 Старт (широта, долгота):", font=('Arial', 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.start_entry = ttk.Entry(main_frame, width=40, font=('Arial', 10))
-        self.start_entry.insert(0, "52.521918, 13.413215")
-        self.start_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
-        
-        ttk.Label(main_frame, text="🎯 Финиш (широта, долгота):", font=('Arial', 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
-        self.end_entry = ttk.Entry(main_frame, width=40, font=('Arial', 10))
-        self.end_entry.insert(0, "52.516275, 13.377704")
-        self.end_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
-        
-        # Buttons frame
-        button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=4, column=0, columnspan=2, pady=20)
-        
-        self.load_btn = ttk.Button(button_frame, text="📥 Загрузить данные города", 
-                                  command=self.load_city_data, width=20)
-        self.load_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.route_btn = ttk.Button(button_frame, text="🛣️ Построить маршрут", 
-                                   command=self.calculate_route, width=20)
-        self.route_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.map_btn = ttk.Button(button_frame, text="🗺️ Карта для выбора точек", 
-                                 command=self.open_selection_map, width=20)
-        self.map_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.show_btn = ttk.Button(button_frame, text="📊 Показать маршрут", 
-                                  command=self.show_route_map, width=20)
-        self.show_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Progress bar
-        ttk.Label(main_frame, text="Прогресс:", font=('Arial', 10)).grid(row=5, column=0, sticky=tk.W, pady=(20, 5))
-        self.progress_bar = ttk.Progressbar(main_frame, mode='determinate', length=400)
-        self.progress_bar.grid(row=5, column=1, sticky=(tk.W, tk.E), pady=(20, 5), padx=(10, 0))
-        
-        self.progress_label = ttk.Label(main_frame, text="Готов к работе", font=('Arial', 9), foreground='#666')
-        self.progress_label.grid(row=6, column=1, sticky=tk.W, padx=(10, 0))
-        
-        # Results notebook
-        notebook = ttk.Notebook(main_frame)
-        notebook.grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=20)
-        
-        # Log tab
-        log_frame = ttk.Frame(notebook, padding=10)
-        self.log_text = scrolledtext.ScrolledText(log_frame, width=80, height=12, font=('Consolas', 9))
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        notebook.add(log_frame, text="📋 Лог")
-        
-        # Results tab
-        result_frame = ttk.Frame(notebook, padding=10)
-        self.result_text = scrolledtext.ScrolledText(result_frame, width=80, height=12, font=('Consolas', 9))
-        self.result_text.pack(fill=tk.BOTH, expand=True)
-        notebook.add(result_frame, text="📊 Результаты")
+        # Setup tabs
+        self.setup_route_tab()
+        self.setup_management_tab()
+        self.setup_log_tab()
         
         # Status bar
         self.status_var = tk.StringVar(value="Готов к работе")
-        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.grid(row=8, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(10, 0))
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.grid(row=1, column=0, sticky='ew', padx=10, pady=(0, 10))
+    
+    def setup_route_tab(self):
+        # Route planning tab
+        route_frame = ttk.Frame(self.notebook, padding=20)
+        self.notebook.add(route_frame, text="🗺️ Планирование маршрутов")
         
-        self.log("=== Планировщик маршрутов дронов запущен ===")
-        self.log("1. Введите название города (например: Berlin, Germany)")
-        self.log("2. Нажмите 'Загрузить данные города'")
-        self.log("3. Укажите координаты старта и финиша")
-        self.log("4. Нажмите 'Построить маршрут'")
+        # Configure grid
+        route_frame.columnconfigure(1, weight=1)
+        route_frame.rowconfigure(5, weight=1)
+        
+        # City selection
+        ttk.Label(route_frame, text="🏙️ Город:", font=('Arial', 11, 'bold')).grid(row=0, column=0, sticky='w', pady=5)
+        self.city_entry = ttk.Entry(route_frame, width=40, font=('Arial', 10))
+        self.city_entry.insert(0, "Berlin, Germany")
+        self.city_entry.grid(row=0, column=1, sticky='ew', pady=5, padx=(10, 0))
+        
+        ttk.Button(route_frame, text="📥 Загрузить данные", command=self.load_city_data, width=20).grid(row=0, column=2, padx=10)
+        
+        # Drone configuration
+        config_frame = ttk.LabelFrame(route_frame, text="Настройки дронов", padding=10)
+        config_frame.grid(row=1, column=0, columnspan=3, sticky='ew', pady=10)
+        config_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(config_frame, text="Тип дрона:").grid(row=0, column=0, sticky='w', pady=2)
+        self.drone_type = tk.StringVar(value="cargo")
+        drone_combo = ttk.Combobox(config_frame, textvariable=self.drone_type, width=20, state='readonly')
+        drone_combo['values'] = ('cargo', 'operator', 'cleaner')
+        drone_combo.grid(row=0, column=1, sticky='w', pady=2, padx=(10, 0))
+        
+        ttk.Label(config_frame, text="Уровень батареи (%):").grid(row=0, column=2, sticky='w', pady=2, padx=(20, 0))
+        self.battery_var = tk.StringVar(value="100")
+        ttk.Entry(config_frame, textvariable=self.battery_var, width=10).grid(row=0, column=3, sticky='w', pady=2, padx=(10, 0))
+        
+        ttk.Label(config_frame, text="Количество дронов:").grid(row=1, column=0, sticky='w', pady=2)
+        self.drone_count = tk.StringVar(value="1")
+        ttk.Entry(config_frame, textvariable=self.drone_count, width=10).grid(row=1, column=1, sticky='w', pady=2, padx=(10, 0))
+        
+        # Points management
+        points_frame = ttk.LabelFrame(route_frame, text="Точки маршрута", padding=10)
+        points_frame.grid(row=2, column=0, columnspan=3, sticky='ew', pady=10)
+        points_frame.columnconfigure(1, weight=1)
+        
+        # Address input
+        ttk.Label(points_frame, text="Адрес или координаты:").grid(row=0, column=0, sticky='w', pady=2)
+        self.address_entry = ttk.Entry(points_frame, width=30)
+        self.address_entry.grid(row=0, column=1, sticky='ew', pady=2, padx=(10, 0))
+        self.address_entry.bind('<Return>', lambda e: self.add_point())
+        
+        ttk.Button(points_frame, text="📍 Добавить точку", command=self.add_point, width=15).grid(row=0, column=2, padx=(10, 0))
+        ttk.Button(points_frame, text="🗺️ Выбрать на карте", command=self.open_selection_map, width=15).grid(row=0, column=3, padx=(10, 0))
+        
+        # Points list
+        list_frame = ttk.Frame(points_frame)
+        list_frame.grid(row=1, column=0, columnspan=4, sticky='ew', pady=(10, 0))
+        list_frame.columnconfigure(0, weight=1)
+        
+        ttk.Label(list_frame, text="Текущие точки:").grid(row=0, column=0, sticky='w')
+        self.points_listbox = tk.Listbox(list_frame, height=6, font=('Arial', 9))
+        self.points_listbox.grid(row=1, column=0, columnspan=3, sticky='nsew', pady=5)
+        
+        # Listbox buttons
+        btn_frame = ttk.Frame(list_frame)
+        btn_frame.grid(row=1, column=3, sticky='ns', padx=(10, 0))
+        
+        ttk.Button(btn_frame, text="⬆️", command=self.move_point_up, width=5).pack(pady=2)
+        ttk.Button(btn_frame, text="⬇️", command=self.move_point_down, width=5).pack(pady=2)
+        ttk.Button(btn_frame, text="✖️", command=self.remove_point, width=5).pack(pady=2)
+        ttk.Button(btn_frame, text="🧹", command=self.clear_points, width=5).pack(pady=2)
+        
+        # Route actions
+        action_frame = ttk.Frame(route_frame)
+        action_frame.grid(row=3, column=0, columnspan=3, pady=20)
+        
+        ttk.Button(action_frame, text="🛣️ Построить маршруты", command=self.calculate_routes, 
+                  style='Accent.TButton', width=20).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="📊 Показать на карте", command=self.show_routes_map, 
+                  width=20).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="💾 Экспорт маршрутов", command=self.export_routes, 
+                  width=20).pack(side=tk.LEFT, padx=5)
+        
+        # Progress
+        ttk.Label(route_frame, text="Прогресс:", font=('Arial', 10)).grid(row=4, column=0, sticky='w', pady=(10, 5))
+        self.progress_bar = ttk.Progressbar(route_frame, mode='determinate')
+        self.progress_bar.grid(row=4, column=1, columnspan=2, sticky='ew', pady=(10, 5), padx=(10, 0))
+        
+        self.progress_label = ttk.Label(route_frame, text="Готов к работе", font=('Arial', 9), foreground='#666')
+        self.progress_label.grid(row=5, column=0, columnspan=3, sticky='w')
+        
+        # Results
+        results_frame = ttk.LabelFrame(route_frame, text="Результаты планирования", padding=10)
+        results_frame.grid(row=6, column=0, columnspan=3, sticky='nsew', pady=10)
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+        
+        self.results_text = scrolledtext.ScrolledText(results_frame, width=60, height=12, font=('Consolas', 9))
+        self.results_text.pack(fill=tk.BOTH, expand=True)
+    
+    def setup_management_tab(self):
+        # Drone management tab
+        management_frame = ttk.Frame(self.notebook, padding=20)
+        self.notebook.add(management_frame, text="🚁 Управление дронами")
+        
+        ttk.Label(management_frame, text="Функционал управления дронами в разработке", 
+                 font=('Arial', 14), foreground='#666').pack(expand=True)
+    
+    def setup_log_tab(self):
+        # Log tab
+        log_frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(log_frame, text="📋 Лог системы")
+        
+        self.log_text = scrolledtext.ScrolledText(log_frame, width=80, height=20, font=('Consolas', 9))
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Add initial log message
+        self.log("=== Система планирования маршрутов дронов запущена ===")
+        self.log("Для начала работы:")
+        self.log("1. Введите название города и загрузите данные")
+        self.log("2. Выберите тип дрона и настройки")
+        self.log("3. Добавьте точки маршрута (адрес или выбор на карте)")
+        self.log("4. Постройте маршруты")
     
     def log(self, message):
         """Добавление сообщения в лог"""
@@ -130,7 +184,7 @@ class ModernDroneRoutePlanner:
             self.progress_label.config(text=message)
             self.status_var.set(message)
             if message:
-                self.log(f"[{stage.upper()}] {message} ({percentage}%)")
+                self.log(f"[{stage.upper()}] {message}")
         
         self.root.after(0, update)
     
@@ -143,14 +197,12 @@ class ModernDroneRoutePlanner:
         
         def load_thread():
             try:
-                self.load_btn.config(state='disabled')
                 self.log(f"Загрузка данных для: {city_name}")
                 
-                # Загрузка данных
                 city_data = self.data_service.get_city_data(city_name)
+                drone_type = self.drone_type.get()
                 
-                # Построение графа
-                city_graph = self.graph_service.build_city_graph(city_data)
+                city_graph = self.graph_service.build_city_graph(city_data, drone_type)
                 self.routing_service.city_graphs[city_name] = city_graph
                 
                 self.current_city = city_name
@@ -163,128 +215,204 @@ class ModernDroneRoutePlanner:
                 error_msg = str(e)
                 self.log(f"✗ Ошибка загрузки: {error_msg}")
                 messagebox.showerror("Ошибка", f"Не удалось загрузить данные: {error_msg}")
-            finally:
-                self.load_btn.config(state='normal')
         
         threading.Thread(target=load_thread, daemon=True).start()
     
-    def calculate_route(self):
-        """Расчет маршрута"""
+    def add_point(self):
+        """Добавление точки маршрута"""
+        address = self.address_entry.get().strip()
+        if not address:
+            messagebox.showwarning("Ошибка", "Введите адрес или координаты")
+            return
+        
+        # Try to parse as coordinates
+        if ',' in address:
+            try:
+                coords = tuple(map(float, [x.strip() for x in address.split(',')]))
+                if len(coords) == 2:
+                    point_text = f"{coords[0]:.6f}, {coords[1]:.6f}"
+                    self.drone_points.append(coords)
+                    self.points_listbox.insert(tk.END, point_text)
+                    self.address_entry.delete(0, tk.END)
+                    self.log(f"✓ Добавлена точка: {point_text}")
+                    return
+            except ValueError:
+                pass
+        
+        # Try to geocode address
+        def geocode_thread():
+            try:
+                coords = self.data_service.address_to_coords(address)
+                if coords:
+                    point_text = f"{coords[0]:.6f}, {coords[1]:.6f} ({address})"
+                    self.drone_points.append(coords)
+                    self.points_listbox.insert(tk.END, point_text)
+                    self.address_entry.delete(0, tk.END)
+                    self.log(f"✓ Добавлена точка: {address} → {coords}")
+                else:
+                    messagebox.showerror("Ошибка", f"Не удалось найти адрес: {address}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Ошибка геокодирования: {str(e)}")
+        
+        threading.Thread(target=geocode_thread, daemon=True).start()
+    
+    def remove_point(self):
+        """Удаление выбранной точки"""
+        selection = self.points_listbox.curselection()
+        if selection:
+            index = selection[0]
+            self.points_listbox.delete(index)
+            self.drone_points.pop(index)
+            self.log("✓ Точка удалена")
+    
+    def clear_points(self):
+        """Очистка всех точек"""
+        self.points_listbox.delete(0, tk.END)
+        self.drone_points = []
+        self.log("✓ Все точки очищены")
+    
+    def move_point_up(self):
+        """Перемещение точки вверх"""
+        selection = self.points_listbox.curselection()
+        if selection and selection[0] > 0:
+            index = selection[0]
+            # Swap in listbox
+            text = self.points_listbox.get(index)
+            self.points_listbox.delete(index)
+            self.points_listbox.insert(index-1, text)
+            self.points_listbox.select_set(index-1)
+            # Swap in points list
+            self.drone_points[index], self.drone_points[index-1] = self.drone_points[index-1], self.drone_points[index]
+    
+    def move_point_down(self):
+        """Перемещение точки вниз"""
+        selection = self.points_listbox.curselection()
+        if selection and selection[0] < len(self.drone_points) - 1:
+            index = selection[0]
+            # Swap in listbox
+            text = self.points_listbox.get(index)
+            self.points_listbox.delete(index)
+            self.points_listbox.insert(index+1, text)
+            self.points_listbox.select_set(index+1)
+            # Swap in points list
+            self.drone_points[index], self.drone_points[index+1] = self.drone_points[index+1], self.drone_points[index]
+    
+    def open_selection_map(self):
+        """Открытие карты для выбора точек"""
         if not self.current_city:
             messagebox.showwarning("Ошибка", "Сначала загрузите данные города")
             return
         
+        def map_thread():
+            try:
+                filename = self.mapping_service.create_selection_map(self.current_city)
+                if filename:
+                    self.mapping_service.open_map(filename)
+                    self.log("Карта для выбора точек открыта в браузере")
+            except Exception as e:
+                self.log(f"✗ Ошибка открытия карты: {str(e)}")
+        
+        threading.Thread(target=map_thread, daemon=True).start()
+    
+    def calculate_routes(self):
+        """Расчет маршрутов для всех дронов"""
+        if not self.current_city:
+            messagebox.showwarning("Ошибка", "Сначала загрузите данные города")
+            return
+        
+        if len(self.drone_points) < 2:
+            messagebox.showwarning("Ошибка", "Добавьте хотя бы 2 точки маршрута")
+            return
+        
         try:
-            start_text = self.start_entry.get().strip()
-            end_text = self.end_entry.get().strip()
+            drone_type = self.drone_type.get()
+            battery_level = float(self.battery_var.get())
             
-            # Парсим координаты
-            start_lat, start_lon = map(float, [x.strip() for x in start_text.split(',')])
-            end_lat, end_lon = map(float, [x.strip() for x in end_text.split(',')])
+            if battery_level <= 0 or battery_level > 100:
+                messagebox.showwarning("Ошибка", "Уровень батареи должен быть от 1 до 100%")
+                return
             
-            start = (start_lat, start_lon)
-            end = (end_lat, end_lon)
+            # Create point pairs for multiple drones
+            num_drones = min(int(self.drone_count.get()), len(self.drone_points) - 1)
+            point_pairs = []
             
-            self.log(f"Расчет маршрута от {start} до {end}")
+            for i in range(num_drones):
+                start = self.drone_points[i % len(self.drone_points)]
+                end = self.drone_points[(i + 1) % len(self.drone_points)]
+                point_pairs.append((start, end))
+                self.drone_types.append(drone_type)
+            
+            self.log(f"Расчет маршрутов для {num_drones} дронов типа '{drone_type}'...")
             
             def route_thread():
                 try:
-                    self.route_btn.config(state='disabled')
-                    path, length, coords = self.routing_service.plan_route(
-                        self.current_city, start, end
+                    routes = self.routing_service.plan_routes(
+                        self.current_city, point_pairs, drone_type, battery_level
                     )
                     
-                    if not path:
-                        self.log("✗ Маршрут не найден")
-                        messagebox.showwarning("Ошибка", "Не удалось построить маршрут")
+                    if not routes:
+                        self.log("✗ Маршруты не найдены")
+                        messagebox.showwarning("Ошибка", "Не удалось построить маршруты")
                         return
                     
-                    self.last_route = coords
+                    self.last_routes = routes
                     
-                    # Вывод результатов
-                    self.result_text.delete(1.0, tk.END)
-                    self.result_text.insert(tk.END, f"✅ МАРШРУТ ПОСТРОЕН\n")
-                    self.result_text.insert(tk.END, f"Город: {self.current_city}\n")
-                    self.result_text.insert(tk.END, f"Примерная длина: {length:.2f} км\n")
-                    self.result_text.insert(tk.END, f"Точек маршрута: {len(coords)}\n\n")
-                    self.result_text.insert(tk.END, "Координаты маршрута:\n")
+                    # Display results
+                    self.results_text.delete(1.0, tk.END)
+                    self.results_text.insert(tk.END, "✅ МАРШРУТЫ ПОСТРОЕНЫ\n\n")
                     
-                    # Показываем первые и последние точки
-                    for i, (lat, lon) in enumerate(coords[:5]):
-                        self.result_text.insert(tk.END, f"{i+1:2d}. {lat:.6f}, {lon:.6f}\n")
+                    for i, (path, length, coords) in enumerate(routes):
+                        self.results_text.insert(tk.END, f"Дрон {i+1} ({drone_type}):\n")
+                        self.results_text.insert(tk.END, f"  Длина: {length:.1f} м\n")
+                        self.results_text.insert(tk.END, f"  Точек: {len(coords)}\n")
+                        self.results_text.insert(tk.END, f"  Старт: {coords[0][0]:.6f}, {coords[0][1]:.6f}\n")
+                        self.results_text.insert(tk.END, f"  Финиш: {coords[-1][0]:.6f}, {coords[-1][1]:.6f}\n\n")
                     
-                    if len(coords) > 5:
-                        self.result_text.insert(tk.END, "...\n")
-                        for i, (lat, lon) in enumerate(coords[-3:], len(coords)-2):
-                            self.result_text.insert(tk.END, f"{i+1:2d}. {lat:.6f}, {lon:.6f}\n")
-                    
-                    self.log("✓ Маршрут успешно построен!")
+                    self.log(f"✓ Построено {len(routes)} маршрутов")
                     
                 except Exception as e:
                     error_msg = str(e)
                     self.log(f"✗ Ошибка расчета: {error_msg}")
-                    messagebox.showerror("Ошибка", f"Ошибка расчета маршрута: {error_msg}")
-                finally:
-                    self.route_btn.config(state='normal')
+                    messagebox.showerror("Ошибка", f"Ошибка расчета маршрутов: {error_msg}")
             
             threading.Thread(target=route_thread, daemon=True).start()
             
         except ValueError:
-            self.log("✗ Ошибка формата координат")
-            messagebox.showerror("Ошибка", "Проверьте формат координат. Пример: 52.521918, 13.413215")
+            self.log("✗ Ошибка в формате данных")
+            messagebox.showerror("Ошибка", "Проверьте правильность введенных данных")
         except Exception as e:
             error_msg = str(e)
             self.log(f"✗ Ошибка: {error_msg}")
             messagebox.showerror("Ошибка", f"Ошибка: {error_msg}")
     
-    def open_selection_map(self):
-        """Открытие карты для выбора точек"""
-        city_name = self.city_entry.get().strip()
-        if not city_name:
-            messagebox.showwarning("Ошибка", "Введите название города")
+    def show_routes_map(self):
+        """Показать маршруты на карте"""
+        if not self.last_routes:
+            messagebox.showwarning("Ошибка", "Сначала постройте маршруты")
             return
         
         def map_thread():
             try:
-                self.log("Создание карты для выбора точек...")
-                filename = self.mapping_service.create_clickable_map(city_name)
+                filename = self.mapping_service.create_route_map(
+                    self.current_city, self.last_routes, self.drone_types
+                )
                 if filename:
-                    success = self.mapping_service.open_map(filename)
-                    if success:
-                        self.log("Карта для выбора точек открыта в браузере")
-                    else:
-                        self.log("Не удалось открыть карту")
-                else:
-                    self.log("Ошибка создания карты")
+                    self.mapping_service.open_map(filename)
+                    self.log("Карта маршрутов открыта в браузере")
             except Exception as e:
                 self.log(f"✗ Ошибка создания карты: {str(e)}")
         
         threading.Thread(target=map_thread, daemon=True).start()
     
-    def show_route_map(self):
-        """Показать маршрут на карте"""
-        if not self.last_route:
-            messagebox.showwarning("Ошибка", "Сначала постройте маршрут")
+    def export_routes(self):
+        """Экспорт маршрутов"""
+        if not self.last_routes:
+            messagebox.showwarning("Ошибка", "Нет маршрутов для экспорта")
             return
         
-        def map_thread():
-            try:
-                self.log("Создание карты маршрута...")
-                filename = self.mapping_service.create_route_map(
-                    self.current_city, self.last_route
-                )
-                if filename:
-                    success = self.mapping_service.open_map(filename)
-                    if success:
-                        self.log("Карта маршрута открыта в браузере")
-                    else:
-                        self.log("Не удалось открыть карту маршрута")
-                else:
-                    self.log("Ошибка создания карты маршрута")
-            except Exception as e:
-                self.log(f"✗ Ошибка создания карты маршрута: {str(e)}")
-        
-        threading.Thread(target=map_thread, daemon=True).start()
+        # Здесь можно добавить логику экспорта в файл
+        self.log("✓ Маршруты подготовлены для экспорта")
+        messagebox.showinfo("Экспорт", "Функция экспорта в разработке")
 
 if __name__ == "__main__":
     root = tk.Tk()

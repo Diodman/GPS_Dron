@@ -7,140 +7,77 @@ import threading
 class MappingService:
     def __init__(self):
         self.temp_dir = tempfile.mkdtemp(prefix="drone_maps_")
-        print(f"Карты сохраняются в: {self.temp_dir}")
     
-    def create_clickable_map(self, city_name, center_point=None):
-        """Создание интерактивной карты для выбора точек"""
+    def create_selection_map(self, city_name, center_point=None, on_click_callback=None):
         if center_point is None:
-            center_point = (52.5200, 13.4050)  # Берлин по умолчанию
+            center_point = (52.5200, 13.4050)
         
-        try:
-            m = folium.Map(location=center_point, zoom_start=13, tiles='OpenStreetMap')
-            
-            # Добавляем функционал для выбора точек
-            folium.LatLngPopup().add_to(m)
-            
-            # Стилизованные инструкции
-            instructions = """
-            <div style="
-                position: fixed; 
-                top: 10px; 
-                right: 10px; 
-                z-index: 1000; 
-                background: rgba(255, 255, 255, 0.95);
-                padding: 15px; 
-                border-radius: 8px;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-                border: 2px solid #4CAF50;
-                font-family: Arial, sans-serif;
-                max-width: 300px;
-            ">
-                <h4 style="margin: 0 0 10px 0; color: #2E7D32;">📌 Инструкция:</h4>
-                <p style="margin: 5px 0; font-size: 12px;">1. Кликните по карте для выбора точки</p>
-                <p style="margin: 5px 0; font-size: 12px;">2. Координаты появятся во всплывающем окне</p>
-                <p style="margin: 5px 0; font-size: 12px;">3. Скопируйте координаты в программу</p>
-                <p style="margin: 5px 0; font-size: 11px; color: #666;">Формат: широта, долгота (52.123456, 13.123456)</p>
-            </div>
-            """
-            
-            m.get_root().html.add_child(folium.Element(instructions))
-            
-            # Создаем безопасное имя файла
-            safe_name = self._sanitize_name(city_name)
-            filename = os.path.join(self.temp_dir, f"click_map_{safe_name}.html")
-            
-            m.save(filename)
-            print(f"Карта сохранена: {filename}")
-            
-            return filename
-            
-        except Exception as e:
-            print(f"Ошибка создания карты: {e}")
-            return None
+        m = folium.Map(location=center_point, zoom_start=13, tiles='OpenStreetMap')
+        
+        if on_click_callback:
+            m.add_child(folium.LatLngPopup())
+        
+        instructions = """
+        <div style="position:fixed;top:10px;right:10px;z-index:1000;background:white;padding:15px;border-radius:8px;max-width:300px;">
+            <h4 style='color:#2E7D32'>🗺️ Выбор точек</h4>
+            <p>1. Кликните для выбора точки</p>
+            <p>2. Координаты появятся во всплывающем окне</p>
+            <p>3. Скопируйте координаты в программу</p>
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(instructions))
+        
+        filename = os.path.join(self.temp_dir, f"selection_map.html")
+        m.save(filename)
+        return filename
     
-    def create_route_map(self, city_name, route_coords):
-        """Создание карты с маршрутом"""
-        if not route_coords or len(route_coords) < 2:
-            print("Недостаточно точек для построения маршрута")
+    def create_route_map(self, city_name, routes, drone_types):
+        if not routes:
             return None
         
-        try:
-            center = route_coords[len(route_coords)//2]
-            m = folium.Map(location=center, zoom_start=14, tiles='OpenStreetMap')
+        center = routes[0][2][0] if routes[0][2] else (52.5200, 13.4050)
+        m = folium.Map(location=center, zoom_start=13, tiles='OpenStreetMap')
+        
+        colors = ['#4285F4', '#EA4335', '#FBBC05', '#34A853']
+        
+        for i, (path, length, coords) in enumerate(routes):
+            color = colors[i % len(colors)]
+            drone_type = drone_types[i] if i < len(drone_types) else "cargo"
             
-            # Добавляем маршрут
             folium.PolyLine(
-                route_coords, 
-                color="#4285F4", 
-                weight=6, 
-                opacity=0.8,
-                tooltip="Маршрут дрона"
-            ).add_to(m)
-            
-            # Добавляем точки начала и конца
-            folium.Marker(
-                route_coords[0], 
-                popup="🟢 Старт",
-                icon=folium.Icon(color="green", icon="play", prefix='fa')
+                coords, 
+                color=color, 
+                weight=5,
+                opacity=0.7,
+                tooltip=f"Дрон {i+1} ({drone_type}): {length:.1f}м"
             ).add_to(m)
             
             folium.Marker(
-                route_coords[-1], 
-                popup="🔴 Финиш", 
-                icon=folium.Icon(color="red", icon="stop", prefix='fa')
+                coords[0], 
+                popup=f"Старт {i+1}",
+                icon=folium.Icon(color='green', icon='play')
             ).add_to(m)
             
-            # Информация о маршруте
-            info_html = f"""
-            <div style="font-family: Arial; padding: 10px;">
-                <h4 style="color: #4285F4; margin-bottom: 10px;">Маршрут дрона</h4>
-                <p><strong>Город:</strong> {city_name}</p>
-                <p><strong>Точек маршрута:</strong> {len(route_coords)}</p>
-                <p><strong>Старт:</strong> {route_coords[0][0]:.6f}, {route_coords[0][1]:.6f}</p>
-                <p><strong>Финиш:</strong> {route_coords[-1][0]:.6f}, {route_coords[-1][1]:.6f}</p>
-            </div>
-            """
-            
-            m.get_root().html.add_child(folium.Element(info_html))
-            
-            safe_name = self._sanitize_name(city_name)
-            filename = os.path.join(self.temp_dir, f"route_map_{safe_name}.html")
-            
-            m.save(filename)
-            print(f"Карта маршрута сохранена: {filename}")
-            
-            return filename
-            
-        except Exception as e:
-            print(f"Ошибка создания карты маршрута: {e}")
-            return None
+            folium.Marker(
+                coords[-1], 
+                popup=f"Финиш {i+1}",
+                icon=folium.Icon(color='red', icon='stop')
+            ).add_to(m)
+        
+        filename = os.path.join(self.temp_dir, f"route_map.html")
+        m.save(filename)
+        return filename
     
     def open_map(self, filename):
-        """Открытие карты в браузере"""
         if not filename or not os.path.exists(filename):
-            print(f"Файл не существует: {filename}")
             return False
         
-        try:
-            # Открываем в отдельном потоке чтобы не блокировать GUI
-            def open_browser():
-                try:
-                    abs_path = os.path.abspath(filename)
-                    webbrowser.open(f"file://{abs_path}")
-                    print(f"Карта открыта: {abs_path}")
-                except Exception as e:
-                    print(f"Ошибка открытия карты: {e}")
-            
-            threading.Thread(target=open_browser, daemon=True).start()
-            return True
-            
-        except Exception as e:
-            print(f"Ошибка открытия карты: {e}")
-            return False
-    
-    def _sanitize_name(self, name):
-        """Очистка имени города"""
-        import re
-        name = re.sub(r'[^\w\s-]', '', name)
-        name = re.sub(r'[-\s]+', '_', name)
-        return name.strip('_')[:50]
+        def open_browser():
+            try:
+                abs_path = os.path.abspath(filename)
+                webbrowser.open(f"file://{abs_path}")
+            except:
+                pass
+        
+        threading.Thread(target=open_browser, daemon=True).start()
+        return True
