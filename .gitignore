@@ -17,3 +17,5 @@ Thumbs.db
 
 cache/
 cache_graphs/
+cache_data/
+__pycache__
