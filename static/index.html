@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Планировщик дронов</title>
+	<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+		body { margin:0; font-family: Arial, sans-serif; }
+        #app { display:flex; height:100vh; }
+        #sidebar { width:360px; border-right:1px solid #ddd; padding:12px; box-sizing:border-box; overflow:auto; }
+		#map { flex:1; }
+		.order { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
+		label { display:block; margin-top:8px; font-size:12px; }
+		input, select { width:100%; padding:6px; box-sizing:border-box; }
+		button { margin-top:8px; padding:8px 10px; }
+        .row { display:flex; gap:8px; align-items:center; }
+        .row > * { flex:1; }
+        .drone { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
+        .muted { color:#666; font-size:12px; }
+        .toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; }
+        .theme-dark body { background:#111; color:#eee; }
+        .theme-dark #sidebar { background:#181818; border-right-color:#333; }
+        .theme-dark .order, .theme-dark .drone { border-color:#333; }
+	</style>
+</head>
+<body>
+<div id="app">
+	<div id="sidebar">
+        <div class="toolbar">
+            <h3>Заказы</h3>
+            <label style="margin:0;display:flex;gap:6px;align-items:center;font-size:12px;">
+                <input type="checkbox" id="themeToggle"/>
+                Тёмная тема
+            </label>
+        </div>
+		<div id="orders"></div>
+		<hr />
+        <h4>Дроны</h4>
+        <div id="drones"></div>
+        <hr />
+        <h4>Добавить заказ</h4>
+        <label>Откуда (широта, долгота или адрес)</label>
+        <input id="from" placeholder="48.7, 44.5 или адрес" />
+        <label>Куда (широта, долгота или адрес)</label>
+        <input id="to" placeholder="48.7, 44.6 или адрес" />
+        <div class="row">
+            <button onclick="useClick('from')">Выбрать Откуда на карте</button>
+            <button onclick="useClick('to')">Выбрать Куда на карте</button>
+        </div>
+        <label>Тип</label>
+		<select id="type">
+            <option value="delivery">доставка</option>
+            <option value="shooting">съёмка</option>
+            <option value="work">работа</option>
+		</select>
+        <label>Батарея %</label>
+		<input id="battery" type="number" min="1" max="100" value="100" />
+        <label>Промежуточные точки (улицы/адреса, по одной в строке)</label>
+        <textarea id="waypoints" rows="3" placeholder="ул. Пример, 1\nул. Вторая, 5"></textarea>
+        <div class="row">
+            <input id="batchCount" type="number" min="1" max="10" value="1" />
+            <button onclick="submitOrder()">Отправить</button>
+        </div>
+		<hr />
+        <h4>Бесполётные зоны</h4>
+        <p>Shift + зажатая левая кнопка — нарисовать прямоугольник</p>
+        <button onclick="clearZones()">Очистить зоны</button>
+		<hr />
+        <h4>Город</h4>
+		<input id="city" value="Volgograd, Russia" />
+        <button onclick="loadCity()">Загрузить</button>
+	</div>
+	<div id="map"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+let map = L.map('map').setView([48.7080, 44.5133], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+let droneMarkers = {};
+let zoneLayers = [];
+let routeLayers = [];
+let currentPick = null;
+let changeDestOrderId = null;
+
+let ws;
+function connectWS(){
+	const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+	ws = new WebSocket(`${proto}://${location.host}/ws`);
+	ws.onmessage = ev => {
+		const s = JSON.parse(ev.data);
+		updateOrders(s.orders||[]);
+		updateDrones(s.drones||{});
+		drawZones(s.no_fly_zones||[]);
+	};
+	ws.onclose = ()=> setTimeout(connectWS, 1000);
+}
+connectWS();
+
+function updateOrders(orders){
+	const c = document.getElementById('orders');
+	c.innerHTML = '';
+    orders.forEach((o, i)=>{
+		const d = document.createElement('div');
+		d.className = 'order';
+        d.innerHTML = `#${i+1} ${o.type} <b>${ruStatus(o.status)}</b><br>${fmt(o.start)} → ${fmt(o.end)}<br>`+
+            (o.id?`<span class="muted">${o.id}</span>`:'')+
+            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить точку</button></div>`:'');
+		c.appendChild(d);
+	});
+}
+function fmt(p){ return p ? `${p[0].toFixed(5)}, ${p[1].toFixed(5)}` : '-'; }
+
+function updateDrones(drones){
+	Object.values(routeLayers).forEach(l=> map.removeLayer(l));
+	routeLayers = [];
+    const list = document.getElementById('drones');
+    list.innerHTML='';
+	for (const id in drones){
+		const d = drones[id];
+        const icon = L.divIcon({className:'drone-icon', html:`<div style="width:18px;height:18px;background:#1976D2;border-radius:50%;border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,.4)"></div>`});
+        if (!droneMarkers[id]){
+            droneMarkers[id] = L.marker(d.pos,{icon}).addTo(map).bindPopup(id);
+        }else{
+            droneMarkers[id].setLatLng(d.pos);
+        }
+		if (d.route && d.route.length){
+			const poly = L.polyline(d.route, {color:'#1976D2'}).addTo(map);
+			routeLayers.push(poly);
+		}
+        const item = document.createElement('div');
+        item.className='drone';
+        const eta = d.eta_s!=null?`${Math.round(d.eta_s/60)} мин`:'-';
+        const bat = d.battery!=null?`${d.battery.toFixed(0)}%`:'-';
+        const toStreet = (d.route && d.target_idx!=null && d.route[d.target_idx]) ? d.route[d.target_idx] : null;
+        item.innerHTML = `<b>${id}</b> • ${ruStatus(d.status)||'-'}<br>`+
+            `Заряд: ${bat} • Осталось: ${eta}` + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
+        item.onclick = ()=> focusDrone(id);
+        list.appendChild(item);
+        if (toStreet){ fetchStreet(toStreet, id); }
+	}
+}
+
+function drawZones(zones){
+	zoneLayers.forEach(l=> map.removeLayer(l));
+	zoneLayers = [];
+	zones.forEach(z=>{
+		const b = [[Math.min(z.lat_min, z.lat_max), Math.min(z.lon_min, z.lon_max)], [Math.max(z.lat_min, z.lat_max), Math.max(z.lon_min, z.lon_max)]];
+		const r = L.rectangle(b, {color:'#EA4335', weight:1, fillOpacity:0.2}).addTo(map);
+		zoneLayers.push(r);
+	});
+}
+
+async function loadCity(){
+	const city = document.getElementById('city').value;
+	await fetch('/api/load_city', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({city})});
+}
+
+function parseMaybeCoords(s){
+	if (!s) return null;
+	if (s.includes(',')){
+		try{ const [a,b] = s.split(',').map(x=>parseFloat(x.trim())); if (!isNaN(a)&&!isNaN(b)) return [a,b]; }catch(e){}
+	}
+	return null;
+}
+
+async function submitOrder(){
+    const f = document.getElementById('from').value.trim();
+    const t = document.getElementById('to').value.trim();
+    const type = document.getElementById('type').value;
+    const battery = parseFloat(document.getElementById('battery').value||'100');
+    const batch = Math.max(1, Math.min(10, parseInt(document.getElementById('batchCount').value||'1')));
+    const waypointsText = (document.getElementById('waypoints').value||'').trim();
+    const wpCoords = [];
+    if (waypointsText){
+        for (const line of waypointsText.split(/\n+/)){
+            const s = line.trim(); if (!s) continue;
+            const pc = parseMaybeCoords(s);
+            if (pc) wpCoords.push(pc);
+        }
+    }
+    for (let i=0;i<batch;i++){
+        const body = { type_hint: type, battery_level: battery };
+        const fc = parseMaybeCoords(f); const tc = parseMaybeCoords(t);
+        if (fc) body.coords_from = fc; else body.address_from = f;
+        if (tc) body.coords_to = tc; else body.address_to = t;
+        if (wpCoords.length) body.waypoints = wpCoords;
+        await fetch('/api/orders', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    }
+}
+
+function useClick(which){
+    currentPick = which;
+}
+
+map.on('click', (e)=>{
+    const {lat, lng} = e.latlng;
+    if (currentPick){
+        const s = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+        document.getElementById(currentPick).value = s;
+        currentPick = null;
+        return;
+    }
+    if (changeDestOrderId){
+        updateOrderDestination(changeDestOrderId, [lat, lng]);
+        changeDestOrderId = null;
+        return;
+    }
+});
+
+// rectangle drawing with Shift+Drag
+let drawing = false; let startLatLng = null; let tempRect = null;
+map.on('mousedown', (e)=>{ if (!e.originalEvent.shiftKey) return; drawing = true; startLatLng = e.latlng; tempRect && map.removeLayer(tempRect); });
+map.on('mousemove', (e)=>{ if (!drawing) return; const bounds = L.latLngBounds(startLatLng, e.latlng); tempRect && map.removeLayer(tempRect); tempRect = L.rectangle(bounds, {color:'#EA4335', weight:1, dashArray:'4', fillOpacity:0.1}).addTo(map); });
+map.on('mouseup', async (e)=>{
+	if (!drawing) return; drawing = false;
+	const bounds = L.latLngBounds(startLatLng, e.latlng);
+	const sw = bounds.getSouthWest(); const ne = bounds.getNorthEast();
+	await fetch('/api/no_fly_zones', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({lat_min: sw.lat, lon_min: sw.lng, lat_max: ne.lat, lon_max: ne.lng})});
+	if (tempRect) { map.removeLayer(tempRect); tempRect = null; }
+});
+
+async function clearZones(){
+	const res = await (await fetch('/api/no_fly_zones')).json();
+	for (const z of res){ await fetch(`/api/no_fly_zones/${z.id}`, {method:'DELETE'}); }
+}
+
+async function cancelOrder(id){
+    if (!id) return;
+    await fetch(`/api/orders/${id}/cancel`, {method:'POST'});
+}
+
+function pickNewDestination(orderId){
+    changeDestOrderId = orderId;
+}
+
+async function updateOrderDestination(orderId, coords){
+    await fetch(`/api/orders/${orderId}/update_destination`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ new_coords_to: coords })
+    });
+}
+
+// Theme toggle
+const themeToggle = document.getElementById('themeToggle');
+themeToggle.addEventListener('change', ()=>{
+    document.documentElement.classList.toggle('theme-dark', themeToggle.checked);
+});
+
+function ruStatus(s){
+    return ({
+        'idle':'свободен', 'enroute':'в пути', 'avoidance':'обход препятствия', 'holding':'ожидание', 'low_battery':'низкий заряд', 'assigned':'назначен', 'queued':'в очереди', 'cancelled':'отменён'
+    })[s]||s;
+}
+
+function focusDrone(id){
+    const m = droneMarkers[id];
+    if (m){ map.setView(m.getLatLng(), 15); m.openPopup(); }
+}
+
+async function fetchStreet(latlng, droneId){
+    try{
+        const [lat, lon] = latlng;
+        const r = await fetch('/api/reverse', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({lat, lon})});
+        const j = await r.json();
+        const el = document.getElementById(`street_${droneId}`);
+        if (el){ el.textContent = j.address || '—'; }
+    }catch(e){}
+}
+
+// Автозагрузка города при старте (для удобства)
+window.addEventListener('load', ()=>{ loadCity(); });
+</script>
+</body>
+</html>

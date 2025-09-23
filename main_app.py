@@ -1,10 +1,21 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import threading
+import logging
 from data_service import DataService
 from graph_service import GraphService
 from routing_service import RoutingService
 from mapping_service import MappingService
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('drone_planner.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 
 class ModernDroneRoutePlanner:
     def __init__(self, root):
@@ -13,23 +24,34 @@ class ModernDroneRoutePlanner:
         self.root.geometry("1400x900")
         self.root.configure(bg='#f5f5f5')
         
-        # Инициализация сервисов
-        self.data_service = DataService()
-        self.graph_service = GraphService()
-        self.routing_service = RoutingService(self.graph_service)
-        self.mapping_service = MappingService()
+        # Настройка логирования
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("Запуск приложения планирования маршрутов дронов")
         
-        # Подписка на события прогресса
-        self.data_service.add_progress_callback(self.update_progress)
-        self.graph_service.add_progress_callback(self.update_progress)
-        self.routing_service.add_progress_callback(self.update_progress)
-        
-        self.current_city = None
-        self.last_routes = []
-        self.drone_points = []
-        self.drone_types = []
-        
-        self.setup_ui()
+        try:
+            # Инициализация сервисов
+            self.data_service = DataService()
+            self.graph_service = GraphService()
+            self.routing_service = RoutingService(self.graph_service)
+            self.mapping_service = MappingService()
+            
+            # Подписка на события прогресса
+            self.data_service.add_progress_callback(self.update_progress)
+            self.graph_service.add_progress_callback(self.update_progress)
+            self.routing_service.add_progress_callback(self.update_progress)
+            
+            self.current_city = None
+            self.last_routes = []
+            self.drone_points = []
+            self.drone_types = []
+            
+            self.setup_ui()
+            self.logger.info("Приложение успешно инициализировано")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка инициализации приложения: {e}")
+            messagebox.showerror("Критическая ошибка", f"Не удалось запустить приложение: {e}")
+            raise
     
     def setup_ui(self):
         # Configure main grid
@@ -62,7 +84,7 @@ class ModernDroneRoutePlanner:
         # City selection
         ttk.Label(route_frame, text="🏙️ Город:", font=('Arial', 11, 'bold')).grid(row=0, column=0, sticky='w', pady=5)
         self.city_entry = ttk.Entry(route_frame, width=40, font=('Arial', 10))
-        self.city_entry.insert(0, "Berlin, Germany")
+        self.city_entry.insert(0, "Volgograd, Russia")
         self.city_entry.grid(row=0, column=1, sticky='ew', pady=5, padx=(10, 0))
         
         ttk.Button(route_frame, text="📥 Загрузить данные", command=self.load_city_data, width=20).grid(row=0, column=2, padx=10)
@@ -189,7 +211,7 @@ class ModernDroneRoutePlanner:
         self.root.after(0, update)
     
     def load_city_data(self):
-        """Загрузка данных города"""
+        """Загрузка данных города с улучшенной обработкой ошибок"""
         city_name = self.city_entry.get().strip()
         if not city_name:
             messagebox.showwarning("Ошибка", "Введите название города")
@@ -197,62 +219,110 @@ class ModernDroneRoutePlanner:
         
         def load_thread():
             try:
+                self.logger.info(f"Начало загрузки данных для: {city_name}")
                 self.log(f"Загрузка данных для: {city_name}")
                 
+                # Загружаем данные города
                 city_data = self.data_service.get_city_data(city_name)
+                if not city_data:
+                    raise Exception("Не удалось получить данные города")
+                
+                # Проверяем наличие дорожной сети
+                if 'road_graph' not in city_data or len(city_data['road_graph'].nodes) == 0:
+                    raise Exception("Дорожная сеть города пуста или недоступна")
+                
                 drone_type = self.drone_type.get()
                 
+                # Строим граф города
                 city_graph = self.graph_service.build_city_graph(city_data, drone_type)
+                if len(city_graph.nodes) == 0:
+                    raise Exception("Не удалось построить граф города")
+                
+                # Сохраняем граф для маршрутизации
                 self.routing_service.city_graphs[city_name] = city_graph
-                
                 self.current_city = city_name
-                stats = f"Узлов: {len(city_graph.nodes)}, Ребер: {len(city_graph.edges)}"
-                self.log(f"✓ Данные загружены: {stats}")
                 
-                messagebox.showinfo("Успех", f"Данные города '{city_name}' загружены\n{stats}")
+                # Получаем статистику
+                stats = city_data.get('stats', {})
+                nodes_count = stats.get('nodes', len(city_graph.nodes))
+                edges_count = stats.get('edges', len(city_graph.edges))
+                buildings_count = stats.get('buildings', 0)
+                
+                stats_text = f"Узлов: {nodes_count}, Ребер: {edges_count}"
+                if buildings_count > 0:
+                    stats_text += f", Зданий: {buildings_count}"
+                
+                self.log(f"✓ Данные загружены: {stats_text}")
+                self.logger.info(f"Данные города '{city_name}' успешно загружены: {stats_text}")
+                
+                messagebox.showinfo("Успех", f"Данные города '{city_name}' загружены\n{stats_text}")
                 
             except Exception as e:
                 error_msg = str(e)
                 self.log(f"✗ Ошибка загрузки: {error_msg}")
-                messagebox.showerror("Ошибка", f"Не удалось загрузить данные: {error_msg}")
+                self.logger.error(f"Ошибка загрузки данных для {city_name}: {error_msg}")
+                messagebox.showerror("Ошибка", f"Не удалось загрузить данные:\n{error_msg}\n\nПопробуйте:\n1. Проверить интернет-соединение\n2. Указать полное название города\n3. Добавить 'Russia' к названию города")
         
         threading.Thread(target=load_thread, daemon=True).start()
     
     def add_point(self):
-        """Добавление точки маршрута"""
+        """Добавление точки маршрута с улучшенной обработкой"""
         address = self.address_entry.get().strip()
         if not address:
             messagebox.showwarning("Ошибка", "Введите адрес или координаты")
             return
         
-        # Try to parse as coordinates
+        # Проверяем ограничение на количество точек
+        if len(self.drone_points) >= 10:
+            messagebox.showwarning("Ограничение", "Максимальное количество точек: 10")
+            return
+        
+        # Попытка парсинга как координат
         if ',' in address:
             try:
                 coords = tuple(map(float, [x.strip() for x in address.split(',')]))
                 if len(coords) == 2:
-                    point_text = f"{coords[0]:.6f}, {coords[1]:.6f}"
-                    self.drone_points.append(coords)
-                    self.points_listbox.insert(tk.END, point_text)
-                    self.address_entry.delete(0, tk.END)
-                    self.log(f"✓ Добавлена точка: {point_text}")
-                    return
+                    # Проверяем валидность координат
+                    if -90 <= coords[0] <= 90 and -180 <= coords[1] <= 180:
+                        point_text = f"{coords[0]:.6f}, {coords[1]:.6f}"
+                        self.drone_points.append(coords)
+                        self.points_listbox.insert(tk.END, point_text)
+                        self.address_entry.delete(0, tk.END)
+                        self.log(f"✓ Добавлена точка: {point_text}")
+                        self.logger.info(f"Добавлена точка по координатам: {coords}")
+                        return
+                    else:
+                        messagebox.showwarning("Ошибка", "Некорректные координаты:\nШирота: -90 до 90\nДолгота: -180 до 180")
+                        return
             except ValueError:
                 pass
         
-        # Try to geocode address
+        # Геокодирование адреса
         def geocode_thread():
             try:
-                coords = self.data_service.address_to_coords(address)
+                self.log(f"Поиск координат для: {address}")
+                # Передаем название текущего города для ограничения поиска
+                coords = self.data_service.address_to_coords(address, self.current_city)
                 if coords:
                     point_text = f"{coords[0]:.6f}, {coords[1]:.6f} ({address})"
                     self.drone_points.append(coords)
                     self.points_listbox.insert(tk.END, point_text)
                     self.address_entry.delete(0, tk.END)
                     self.log(f"✓ Добавлена точка: {address} → {coords}")
+                    self.logger.info(f"Добавлена точка по адресу '{address}': {coords}")
                 else:
-                    messagebox.showerror("Ошибка", f"Не удалось найти адрес: {address}")
+                    error_msg = f"Не удалось найти адрес: {address}"
+                    self.log(f"✗ {error_msg}")
+                    self.logger.warning(error_msg)
+                    if self.current_city:
+                        messagebox.showerror("Ошибка", f"{error_msg}\n\nПопробуйте:\n1. Указать более полный адрес\n2. Убедиться что адрес находится в {self.current_city}\n3. Ввести координаты в формате: широта, долгота")
+                    else:
+                        messagebox.showerror("Ошибка", f"{error_msg}\n\nПопробуйте:\n1. Сначала загрузить данные города\n2. Указать более полный адрес\n3. Ввести координаты в формате: широта, долгота")
             except Exception as e:
-                messagebox.showerror("Ошибка", f"Ошибка геокодирования: {str(e)}")
+                error_msg = f"Ошибка геокодирования: {str(e)}"
+                self.log(f"✗ {error_msg}")
+                self.logger.error(f"Ошибка геокодирования для '{address}': {e}")
+                messagebox.showerror("Ошибка", error_msg)
         
         threading.Thread(target=geocode_thread, daemon=True).start()
     
@@ -315,7 +385,7 @@ class ModernDroneRoutePlanner:
         threading.Thread(target=map_thread, daemon=True).start()
     
     def calculate_routes(self):
-        """Расчет маршрутов для всех дронов"""
+        """Расчет маршрутов для всех дронов с улучшенной валидацией"""
         if not self.current_city:
             messagebox.showwarning("Ошибка", "Сначала загрузите данные города")
             return
@@ -332,13 +402,38 @@ class ModernDroneRoutePlanner:
                 messagebox.showwarning("Ошибка", "Уровень батареи должен быть от 1 до 100%")
                 return
             
+            # Проверяем что все точки находятся в разумных пределах города
+            if not self._validate_points_in_city():
+                messagebox.showwarning("Ошибка", "Некоторые точки находятся слишком далеко от города.\nПроверьте координаты точек.")
+                return
+            
             # Create point pairs for multiple drones
             num_drones = min(int(self.drone_count.get()), len(self.drone_points) - 1)
             point_pairs = []
             
+            # Проверяем расстояния между точками
             for i in range(num_drones):
                 start = self.drone_points[i % len(self.drone_points)]
                 end = self.drone_points[(i + 1) % len(self.drone_points)]
+                
+                # Вычисляем расстояние между точками
+                distance = self._calculate_distance(start, end)
+                
+                if distance < 10:  # Менее 10 метров
+                    self.log(f"⚠️ Очень близкие точки {i+1}: {distance:.1f} м")
+                    if not messagebox.askyesno("Близкие точки", 
+                                             f"Точки {i+1} находятся очень близко друг к другу: {distance:.1f} м\n"
+                                             f"Маршрут будет очень коротким.\n"
+                                             f"Продолжить?"):
+                        return
+                elif distance > 50000:  # 50 км
+                    self.log(f"⚠️ Большое расстояние между точками {i+1}: {distance/1000:.1f} км")
+                    if not messagebox.askyesno("Большое расстояние", 
+                                             f"Расстояние между точками {i+1}: {distance/1000:.1f} км\n"
+                                             f"Это может привести к проблемам с маршрутизацией.\n"
+                                             f"Продолжить?"):
+                        return
+                
                 point_pairs.append((start, end))
                 self.drone_types.append(drone_type)
             
@@ -352,7 +447,7 @@ class ModernDroneRoutePlanner:
                     
                     if not routes:
                         self.log("✗ Маршруты не найдены")
-                        messagebox.showwarning("Ошибка", "Не удалось построить маршруты")
+                        messagebox.showwarning("Ошибка", "Не удалось построить маршруты.\nВозможные причины:\n1. Точки находятся слишком далеко друг от друга\n2. Недостаточно данных дорожной сети между точками\n3. Низкий уровень батареи")
                         return
                     
                     self.last_routes = routes
@@ -384,6 +479,60 @@ class ModernDroneRoutePlanner:
             error_msg = str(e)
             self.log(f"✗ Ошибка: {error_msg}")
             messagebox.showerror("Ошибка", f"Ошибка: {error_msg}")
+    
+    def _validate_points_in_city(self):
+        """Проверка что все точки находятся в границах города"""
+        if not self.current_city:
+            return True
+        
+        city_bounds = {
+            'волгоград': {'lat': (48.5, 49.0), 'lon': (44.0, 45.0)},
+            'volgograd': {'lat': (48.5, 49.0), 'lon': (44.0, 45.0)},
+        }
+        
+        normalized_city = self.current_city.lower().strip()
+        if ', russia' in normalized_city:
+            normalized_city = normalized_city[:-8].strip()
+        
+        bounds = None
+        for city_key, city_bounds_data in city_bounds.items():
+            if city_key in normalized_city:
+                bounds = city_bounds_data
+                break
+        
+        if not bounds:
+            return True  # Если город не найден в списке, считаем точки валидными
+        
+        for i, point in enumerate(self.drone_points):
+            lat, lon = point
+            if not (bounds['lat'][0] <= lat <= bounds['lat'][1] and bounds['lon'][0] <= lon <= bounds['lon'][1]):
+                self.log(f"✗ Точка {i+1} ({lat:.6f}, {lon:.6f}) не в границах города")
+                return False
+        
+        return True
+    
+    def _calculate_distance(self, point1, point2):
+        """Вычисление расстояния между двумя точками в метрах"""
+        import math
+        
+        lat1, lon1 = point1
+        lat2, lon2 = point2
+        
+        # Формула гаверсинуса для вычисления расстояния на сфере
+        R = 6371000  # Радиус Земли в метрах
+        
+        lat1_rad = math.radians(lat1)
+        lat2_rad = math.radians(lat2)
+        delta_lat = math.radians(lat2 - lat1)
+        delta_lon = math.radians(lon2 - lon1)
+        
+        a = (math.sin(delta_lat / 2) ** 2 + 
+             math.cos(lat1_rad) * math.cos(lat2_rad) * 
+             math.sin(delta_lon / 2) ** 2)
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        
+        distance = R * c
+        return distance
     
     def show_routes_map(self):
         """Показать маршруты на карте"""

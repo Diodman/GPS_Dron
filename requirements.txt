@@ -1,3 +1,4 @@
+# Основные зависимости для работы с геоданными
 osmnx==1.7.0
 networkx==3.2.1
 geopandas==0.14.1
@@ -5,14 +6,24 @@ folium==0.15.1
 numpy==1.24.3
 shapely==2.0.2
 
-tkinter==0.1.0
-
+# Визуализация и интерфейс
 matplotlib==3.7.2
 pandas==2.0.3
+
+# Геопространственные библиотеки
 rtree==1.0.1
 scipy==1.11.2
+pyproj==3.6.0
+geopy==2.4.1
+aiofiles==23.2.1
+
+# HTTP и веб-запросы
 requests==2.31.0
+
+# Обработка изображений
 pillow==10.0.1
+
+# Вспомогательные библиотеки
 python-dateutil==2.8.2
 pytz==2023.3
 six==1.16.0
@@ -29,5 +40,11 @@ cligj==0.7.2
 fiona==1.9.5
 munch==2.5.0
 packaging==23.1
-pyproj==3.6.0
-geopy==2.4.1
+
+# tkinter встроен в Python, не требует установки
+
+# FastAPI и веб-сервер
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
