@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+.cache/
+.venv/
+.env
+.git/
+.gitignore
+
+# Large caches/data
+cache/
+cache_data/
+*.pkl
+
+# Not needed in image
+click_map.html
+route_map.html
+VOLGOGRAD_GUIDE.md
