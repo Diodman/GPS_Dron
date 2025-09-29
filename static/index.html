@@ -8,8 +8,10 @@
     <style>
 		body { margin:0; font-family: Arial, sans-serif; }
         #app { display:flex; height:100vh; }
-        #sidebar { width:360px; border-right:1px solid #ddd; padding:12px; box-sizing:border-box; overflow:auto; }
-		#map { flex:1; }
+        #sidebar { width:380px; border-right:1px solid #ddd; padding:14px; box-sizing:border-box; overflow:auto; backdrop-filter: blur(4px); }
+        #map { flex:1; }
+        /* prevent layout jumping */
+        #orders, #drones { min-height: 120px; }
 		.order { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
 		label { display:block; margin-top:8px; font-size:12px; }
 		input, select { width:100%; padding:6px; box-sizing:border-box; }
@@ -19,9 +21,19 @@
         .drone { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
         .muted { color:#666; font-size:12px; }
         .toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; }
-        .theme-dark body { background:#111; color:#eee; }
-        .theme-dark #sidebar { background:#181818; border-right-color:#333; }
-        .theme-dark .order, .theme-dark .drone { border-color:#333; }
+        .section { margin-bottom:14px; }
+        .kpi { display:flex; gap:8px; }
+        .kpi > div { flex:1; background:#f7f7f7; padding:8px; border-radius:8px; text-align:center; }
+        .theme-dark .kpi > div { background:#222; }
+        .pill { display:inline-block; padding:2px 6px; border-radius:999px; font-size:12px; }
+        .pill.good { background:#E6F4EA; color:#1E8E3E; }
+        .pill.warn { background:#FEF7E0; color:#B06000; }
+        .pill.bad { background:#FCE8E6; color:#C5221F; }
+        .theme-dark body { background:#0f1115; color:#e0e6ed; }
+        .theme-dark #sidebar { background:#0f1115; border-right-color:#222; }
+        .theme-dark .order, .theme-dark .drone { border-color:#222; background:#12151c; }
+        .theme-dark input, .theme-dark select, .theme-dark textarea { background:#0c0f14; color:#e0e6ed; border:1px solid #1d2330; }
+        .theme-dark button { background:#1b2333; color:#e0e6ed; border:1px solid #2a3550; }
 	</style>
 </head>
 <body>
@@ -34,10 +46,31 @@
                 Тёмная тема
             </label>
         </div>
+        <div class="kpi">
+            <div><div class="muted">Город</div><div id="kpiCity">—</div></div>
+            <div><div class="muted">Дронов</div><div id="kpiDrones">0</div></div>
+            <div><div class="muted">Заказов</div><div id="kpiOrders">0</div></div>
+        </div>
 		<div id="orders"></div>
 		<hr />
         <h4>Дроны</h4>
         <div id="drones"></div>
+        <hr />
+        <div class="section">
+            <h4>База и инвентарь</h4>
+            <label>Координаты базы</label>
+            <div class="row">
+                <input id="base" placeholder="48.7080, 44.5133"/>
+                <button onclick="useClick('base')">На карте</button>
+            </div>
+            <div class="row">
+                <input id="invCargo" type="number" min="0" value="2"/>
+                <input id="invOperator" type="number" min="0" value="1"/>
+                <input id="invCleaner" type="number" min="0" value="0"/>
+            </div>
+            <div class="muted">cargo • operator • cleaner</div>
+            <button onclick="saveBase()">Сохранить базу</button>
+        </div>
         <hr />
         <h4>Добавить заказ</h4>
         <label>Откуда (широта, долгота или адрес)</label>
@@ -45,8 +78,8 @@
         <label>Куда (широта, долгота или адрес)</label>
         <input id="to" placeholder="48.7, 44.6 или адрес" />
         <div class="row">
-            <button onclick="useClick('from')">Выбрать Откуда на карте</button>
-            <button onclick="useClick('to')">Выбрать Куда на карте</button>
+            <button onclick="useClick('from')">Выбрать Откуда</button>
+            <button onclick="useClick('to')">Выбрать Куда</button>
         </div>
         <label>Тип</label>
 		<select id="type">
@@ -67,6 +100,15 @@
         <p>Shift + зажатая левая кнопка — нарисовать прямоугольник</p>
         <button onclick="clearZones()">Очистить зоны</button>
 		<hr />
+        <h4>Станции зарядки</h4>
+        <p>Alt + зажатая левая кнопка — добавить станцию. Ctrl + клик — удалить ближайшую.</p>
+        <div class="row">
+            <button onclick="pushStations()">Сохранить станции</button>
+            <button onclick="clearStations()">Очистить станции</button>
+        </div>
+        <label>Массовое добавление (по одной координате в строке: lat, lon)</label>
+        <textarea id="stationsBulk" rows="3" placeholder="48.700000, 44.500000\n48.710000, 44.520000"></textarea>
+        <button onclick="bulkAddStations()">Добавить станции из списка</button>
         <h4>Город</h4>
 		<input id="city" value="Volgograd, Russia" />
         <button onclick="loadCity()">Загрузить</button>
@@ -80,65 +122,103 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 
 let droneMarkers = {};
 let zoneLayers = [];
 let routeLayers = [];
+let historyLayers = {};
 let currentPick = null;
 let changeDestOrderId = null;
+let stationMarkers = [];
+let stations = [];
+let pushStationsTimer = null;
+function pushStationsDebounced(){
+    if (pushStationsTimer) clearTimeout(pushStationsTimer);
+    pushStationsTimer = setTimeout(()=>{ pushStations(); }, 300);
+}
 
 let ws;
 function connectWS(){
 	const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 	ws = new WebSocket(`${proto}://${location.host}/ws`);
-	ws.onmessage = ev => {
-		const s = JSON.parse(ev.data);
-		updateOrders(s.orders||[]);
-		updateDrones(s.drones||{});
-		drawZones(s.no_fly_zones||[]);
-	};
+ws.onmessage = ev => {
+    const s = JSON.parse(ev.data);
+    updateOrders(s.orders||[]);
+    window.lastHistories = s.histories || {};
+    updateDrones(s.drones||{});
+    drawZones(s.no_fly_zones||[]);
+    // update stations from server truth
+    stations = s.stations || [];
+    drawStations();
+    // populate base input if empty and server sends base
+    if (s.base && (!document.getElementById('base').value || document.getElementById('base').value.trim()==='')){
+        const [lat, lon] = s.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+    }
+    document.getElementById('kpiCity').textContent = s.city || '—';
+    document.getElementById('kpiDrones').textContent = Object.keys(s.drones||{}).length;
+    document.getElementById('kpiOrders').textContent = (s.orders||[]).length;
+};
 	ws.onclose = ()=> setTimeout(connectWS, 1000);
 }
 connectWS();
 
 function updateOrders(orders){
 	const c = document.getElementById('orders');
+	const prevTop = c.scrollTop; const prevHeight = c.scrollHeight;
 	c.innerHTML = '';
     orders.forEach((o, i)=>{
 		const d = document.createElement('div');
 		d.className = 'order';
         d.innerHTML = `#${i+1} ${o.type} <b>${ruStatus(o.status)}</b><br>${fmt(o.start)} → ${fmt(o.end)}<br>`+
             (o.id?`<span class="muted">${o.id}</span>`:'')+
-            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить точку</button></div>`:'');
+            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить точку</button></div>`:(o.status==='completed'?`<div class="muted">выполнен</div>`:''));
 		c.appendChild(d);
 	});
+	// keep scroll stable
+	c.scrollTop = Math.min(prevTop, c.scrollHeight - (prevHeight - prevTop));
 }
 function fmt(p){ return p ? `${p[0].toFixed(5)}, ${p[1].toFixed(5)}` : '-'; }
 
 function updateDrones(drones){
+	// do not reset arrays drastically; remove previous polylines
 	Object.values(routeLayers).forEach(l=> map.removeLayer(l));
 	routeLayers = [];
-    const list = document.getElementById('drones');
-    list.innerHTML='';
-	for (const id in drones){
-		const d = drones[id];
-        const icon = L.divIcon({className:'drone-icon', html:`<div style="width:18px;height:18px;background:#1976D2;border-radius:50%;border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,.4)"></div>`});
+    Object.values(historyLayers).forEach(l=> map.removeLayer(l));
+    historyLayers = {};
+	const list = document.getElementById('drones');
+	const prevTop = list.scrollTop; const prevHeight = list.scrollHeight;
+	list.innerHTML='';
+    const palette = ['#4285F4','#EA4335','#FBBC05','#34A853','#9C27B0','#FF9800','#795548','#607D8B'];
+    const ids = Object.keys(drones);
+    for (let idx=0; idx<ids.length; idx++){
+        const id = ids[idx];
+        const d = drones[id];
+        const color = palette[idx % palette.length];
+        const icon = L.divIcon({className:'drone-icon', html:`<div style="width:18px;height:18px;background:${color};border-radius:50%;border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,.4)"></div>`});
         if (!droneMarkers[id]){
             droneMarkers[id] = L.marker(d.pos,{icon}).addTo(map).bindPopup(id);
         }else{
             droneMarkers[id].setLatLng(d.pos);
+            droneMarkers[id].setIcon(icon);
         }
-		if (d.route && d.route.length){
-			const poly = L.polyline(d.route, {color:'#1976D2'}).addTo(map);
+        if (d.route && d.route.length){
+            const poly = L.polyline(d.route, {color}).addTo(map);
 			routeLayers.push(poly);
 		}
+        if (window.lastHistories && window.lastHistories[id] && window.lastHistories[id].length >= 2){
+            const hpoly = L.polyline(window.lastHistories[id], {color, weight:2, opacity:0.6, dashArray:'4 4'}).addTo(map);
+            historyLayers[id] = hpoly;
+        }
         const item = document.createElement('div');
         item.className='drone';
         const eta = d.eta_s!=null?`${Math.round(d.eta_s/60)} мин`:'-';
         const bat = d.battery!=null?`${d.battery.toFixed(0)}%`:'-';
+        const lq = d.link_quality!=null?qualityPill(d.link_quality):'';
         const toStreet = (d.route && d.target_idx!=null && d.route[d.target_idx]) ? d.route[d.target_idx] : null;
-        item.innerHTML = `<b>${id}</b> • ${ruStatus(d.status)||'-'}<br>`+
+        item.innerHTML = `<b>${id}</b> • ${ruStatus(d.status)||'-'} ${lq}<br>`+
             `Заряд: ${bat} • Осталось: ${eta}` + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
         item.onclick = ()=> focusDrone(id);
-        list.appendChild(item);
+		list.appendChild(item);
         if (toStreet){ fetchStreet(toStreet, id); }
 	}
+	// keep scroll stable
+	list.scrollTop = Math.min(prevTop, list.scrollHeight - (prevHeight - prevTop));
 }
 
 function drawZones(zones){
@@ -149,6 +229,15 @@ function drawZones(zones){
 		const r = L.rectangle(b, {color:'#EA4335', weight:1, fillOpacity:0.2}).addTo(map);
 		zoneLayers.push(r);
 	});
+}
+
+function drawStations(){
+    stationMarkers.forEach(m=> map.removeLayer(m));
+    stationMarkers = [];
+    stations.forEach(s=>{
+        const m = L.circleMarker(s, {radius:6, color:'#34A853', weight:2, fillColor:'#34A853', fillOpacity:0.6}).addTo(map).bindTooltip('Станция зарядки');
+        stationMarkers.push(m);
+    });
 }
 
 async function loadCity(){
@@ -197,13 +286,20 @@ map.on('click', (e)=>{
     const {lat, lng} = e.latlng;
     if (currentPick){
         const s = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
-        document.getElementById(currentPick).value = s;
+        if (currentPick==='base') document.getElementById('base').value = s; else document.getElementById(currentPick).value = s;
         currentPick = null;
         return;
     }
     if (changeDestOrderId){
         updateOrderDestination(changeDestOrderId, [lat, lng]);
         changeDestOrderId = null;
+        return;
+    }
+    // Add station with Alt+Click
+    if (e.originalEvent.altKey){
+        stations.push([lat, lng]);
+        drawStations();
+        pushStationsDebounced();
         return;
     }
 });
@@ -223,6 +319,41 @@ map.on('mouseup', async (e)=>{
 async function clearZones(){
 	const res = await (await fetch('/api/no_fly_zones')).json();
 	for (const z of res){ await fetch(`/api/no_fly_zones/${z.id}`, {method:'DELETE'}); }
+}
+
+function nearestStationIndex(lat, lng){
+    let bi = -1; let bd = 1e18;
+    for (let i=0;i<stations.length;i++){
+        const s = stations[i];
+        const d = Math.hypot(s[0]-lat, s[1]-lng);
+        if (d < bd){ bd = d; bi = i; }
+    }
+    return bi;
+}
+
+map.on('contextmenu', (e)=>{
+    // Ctrl + right-click to remove nearest station
+    if (!e.originalEvent.ctrlKey) return;
+    const {lat, lng} = e.latlng;
+    const idx = nearestStationIndex(lat, lng);
+    if (idx >= 0){ stations.splice(idx, 1); drawStations(); pushStationsDebounced(); }
+});
+
+async function pushStations(){
+    await fetch('/api/stations', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({stations})});
+}
+
+function clearStations(){ stations = []; drawStations(); }
+
+function bulkAddStations(){
+    const t = (document.getElementById('stationsBulk').value||'').trim();
+    if (!t) return;
+    for (const line of t.split(/\n+/)){
+        const s = line.trim(); if (!s) continue;
+        const pc = parseMaybeCoords(s); if (pc) stations.push(pc);
+    }
+    drawStations();
+    pushStationsDebounced();
 }
 
 async function cancelOrder(id){
@@ -269,8 +400,33 @@ async function fetchStreet(latlng, droneId){
     }catch(e){}
 }
 
+function qualityPill(q){
+    let cls = q>=0.75? 'good' : (q>=0.4? 'warn' : 'bad');
+    const pct = Math.round(q*100);
+    return `<span class="pill ${cls}">связь ${pct}%</span>`;
+}
+
+async function saveBase(){
+    const b = document.getElementById('base').value.trim();
+    const bc = parseMaybeCoords(b);
+    const inv = {
+        cargo: parseInt(document.getElementById('invCargo').value||'0'),
+        operator: parseInt(document.getElementById('invOperator').value||'0'),
+        cleaner: parseInt(document.getElementById('invCleaner').value||'0'),
+    };
+    await fetch('/api/base', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({base: bc, inventory: inv})});
+}
+
 // Автозагрузка города при старте (для удобства)
 window.addEventListener('load', ()=>{ loadCity(); });
+// Load base and stations on startup to populate UI quickly
+window.addEventListener('load', async ()=>{
+    try{
+        const r = await fetch('/api/base'); const j = await r.json();
+        if (j.base){ const [lat, lon] = j.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`; }
+        if (Array.isArray(j.stations)){ stations = j.stations; drawStations(); }
+    }catch(e){}
+});
 </script>
 </body>
 </html>

@@ -7,6 +7,8 @@ import requests
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 import logging
+import json
+from redis import Redis
 
 class DataService:
     def __init__(self, cache_dir="cache_data"):
@@ -24,6 +26,15 @@ class DataService:
         # Настройка логирования
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
+        # optional Redis for caching heavy city data
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        try:
+            self._redis: Redis | None = Redis.from_url(redis_url)
+            # do not decode responses here; we store bytes for pickle blobs
+            self._redis.ping()
+        except Exception:
+            self._redis = None
+            self.logger.warning("Redis not available for DataService cache; falling back to disk")
     
     def add_progress_callback(self, callback):
         self.progress_callbacks.append(callback)
@@ -36,7 +47,18 @@ class DataService:
         """Получение данных города (универсально для любой страны)"""
         normalized_name = city_name.strip()
         cache_file = os.path.join(self.cache_dir, f"{self._sanitize_name(normalized_name)}.pkl")
+        redis_key = f"drone_planner:city:{self._sanitize_name(normalized_name)}"
         
+        # Try Redis first
+        if self._redis is not None:
+            try:
+                blob = self._redis.get(redis_key)
+                if blob:
+                    self._update_progress("cache", 100, "Загрузка из Redis")
+                    return pickle.loads(blob)
+            except Exception as e:
+                self.logger.warning(f"Ошибка чтения из Redis: {e}")
+
         if os.path.exists(cache_file):
             self._update_progress("cache", 100, "Загрузка из кэша")
             try:
@@ -45,9 +67,9 @@ class DataService:
                 self.logger.warning(f"Ошибка загрузки кэша: {e}, перезагружаем данные")
                 os.remove(cache_file)
         
-        return self._download_city_data(normalized_name, cache_file)
+        return self._download_city_data(normalized_name, cache_file, redis_key)
     
-    def _download_city_data(self, city_name, cache_file):
+    def _download_city_data(self, city_name, cache_file, redis_key: str | None = None):
         self._update_progress("download", 0, "Начало загрузки данных")
         
         try:
@@ -93,6 +115,12 @@ class DataService:
             self._update_progress("download", 90, "Сохранение в кэш")
             with open(cache_file, 'wb') as f:
                 pickle.dump(data, f)
+            # Save to Redis as well
+            if self._redis is not None and redis_key:
+                try:
+                    self._redis.set(redis_key, pickle.dumps(data))
+                except Exception as e:
+                    self.logger.warning(f"Не удалось сохранить данные города в Redis: {e}")
             
             self._update_progress("download", 100, "Данные загружены")
             return data
