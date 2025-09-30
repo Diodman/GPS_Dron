@@ -1,4 +1,5 @@
 version: "3.9"
+
 services:
   app:
     build: .
@@ -9,7 +10,19 @@ services:
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       - redis
+    restart: unless-stopped
+    volumes:
+      - ./cache_data:/app/cache_data
+      - ./cache:/app/cache
+
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+volumes:
+  redis_data:
