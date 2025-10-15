@@ -55,9 +55,7 @@ class AddOrderRequest(BaseModel):
 	coords_to: Optional[List[float]] = None
 	type_hint: Optional[str] = None  # delivery|shooting|work
 	battery_level: float = 100
-	waypoints: Optional[List[Dict[str, Any]]] = None  # [{"coords": [lat, lon], "address": "str", "type": "pickup|delivery|waypoint"}]
-	drone_id: Optional[str] = None  # указание конкретного дрона
-	priority: Optional[int] = 1  # приоритет заказа (1-10, 10 - высший)
+	waypoints: Optional[List[List[float]]] = None  # optional waypoint coords [ [lat,lon], ... ]
 
 class NoFlyZone(BaseModel):
 	# Simple rectangular zone for MVP: {lat_min, lat_max, lon_min, lon_max}
@@ -72,29 +70,16 @@ STATE: Dict[str, Any] = {
 	"city": None,
 	"city_graph": None,
 	"orders": [],
-	"drones": {},  # drone_id -> {pos, type, battery, route, target_idx, status, health, maintenance_hours, last_maintenance}
+	"drones": {},  # drone_id -> {pos, type, battery, route, target_idx, status}
 	"no_fly_zones": [],
 	"clients": set(),  # websockets
 	"zone_version": 0,
-	"weather": {
-		"wind_mps": 3.0, 
-		"time_of_day": "day", 
-		"visibility": 10.0,
-		"temperature": 20.0,
-		"humidity": 60.0,
-		"pressure": 1013.25,
-		"cloud_cover": 30.0,
-		"precipitation": 0.0,
-		"uv_index": 5.0,
-		"last_updated": None
-	},
+	"weather": {"wind_mps": 3.0},
     "base": None,  # base location lat, lon
 	"inventory": {},  # type -> count available at base
 	"stations": [],  # list of (lat, lon)
     "station_queues": {},  # station_index -> {charging:[], queue:[], capacity:int}
     "base_queue": {"charging": [], "queue": [], "capacity": 2},
-    "order_queues": {},  # type -> [orders] - очереди по типам заказов
-    "route_optimization": True,  # включена ли оптимизация маршрутов
 }
 
 # Helpers
@@ -136,21 +121,6 @@ async def scheduler_loop():
 			logger.exception("persist_state error")
 		await asyncio.sleep(1.0)
 
-async def weather_update_loop():
-	"""Автообновление погоды каждую минуту"""
-	while True:
-		try:
-			city = STATE.get("city")
-			if city:
-				weather_data = await get_real_weather_data(city)
-				STATE["weather"] = weather_data
-				await persist_state()
-				logger.info(f"Погода обновлена для {city}")
-			await asyncio.sleep(60.0)  # обновляем каждую минуту
-		except Exception:
-			logger.exception("weather_update_loop error")
-			await asyncio.sleep(60.0)
-
 @app.on_event("startup")
 async def on_startup():
 	await restore_state()
@@ -161,7 +131,6 @@ async def on_startup():
 		logger.exception("ensure_base_drones on startup failed")
 	asyncio.create_task(broadcaster_loop())
 	asyncio.create_task(scheduler_loop())
-	asyncio.create_task(weather_update_loop())
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -198,60 +167,7 @@ async def get_state():
         "base": STATE["base"],
 		"inventory": STATE["inventory"],
 		"stations": STATE["stations"],
-		"route_optimization": STATE.get("route_optimization", True),
-		"order_queues": {
-			order_type: len(orders) 
-			for order_type, orders in STATE.get("order_queues", {}).items()
-		}
 	}
-
-@app.get("/api/system_status")
-async def get_system_status():
-	"""Получение детального статуса системы"""
-	try:
-		# Статистика дронов
-		drone_stats = {}
-		for drone_type in ["cargo", "operator", "cleaner"]:
-			drones_of_type = [d for d in STATE["drones"].values() if d.get("type") == drone_type]
-			drone_stats[drone_type] = {
-				"total": len(drones_of_type),
-				"idle": len([d for d in drones_of_type if d.get("status") == "idle"]),
-				"enroute": len([d for d in drones_of_type if d.get("status") == "enroute"]),
-				"charging": len([d for d in drones_of_type if d.get("status") in ("charging", "charging_with_cargo")]),
-				"malfunction": len([d for d in drones_of_type if d.get("status") == "malfunction"]),
-				"maintenance": len([d for d in drones_of_type if d.get("status") in ("needs_maintenance", "maintenance")])
-			}
-		
-		# Статистика заказов
-		order_stats = {
-			"total": len(STATE["orders"]),
-			"queued": len([o for o in STATE["orders"] if o.get("status") == "queued"]),
-			"assigned": len([o for o in STATE["orders"] if o.get("status") == "assigned"]),
-			"completed": len([o for o in STATE["orders"] if o.get("status") == "completed"]),
-			"cancelled": len([o for o in STATE["orders"] if o.get("status") == "cancelled"])
-		}
-		
-		# Статистика очередей
-		queue_stats = {}
-		for order_type, orders in STATE.get("order_queues", {}).items():
-			queue_stats[order_type] = {
-				"count": len(orders),
-				"avg_priority": sum(o.get("priority", 1) for o in orders) / len(orders) if orders else 0
-			}
-		
-		return {
-			"ok": True,
-			"drone_stats": drone_stats,
-			"order_stats": order_stats,
-			"queue_stats": queue_stats,
-			"weather": STATE["weather"],
-			"route_optimization": STATE.get("route_optimization", True),
-			"timestamp": datetime.utcnow().isoformat()
-		}
-		
-	except Exception as e:
-		logger.error(f"Ошибка получения статуса системы: {e}")
-		return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 @app.post("/api/reverse")
 async def reverse_geocode(body: Dict[str, float]):
@@ -302,49 +218,6 @@ async def remove_no_fly_zone(zone_id: str):
 		await persist_state()
 	return {"ok": True, "removed": removed }
 
-@app.post("/api/no_fly_zones/clear")
-async def clear_all_no_fly_zones():
-	"""Очистка всех бесполетных зон"""
-	cleared_count = len(STATE["no_fly_zones"])
-	STATE["no_fly_zones"] = []
-	STATE["zone_version"] += 1
-	await rebuild_graph_with_zones()
-	await persist_state()
-	return {"ok": True, "cleared": cleared_count}
-
-@app.post("/api/stations/clear")
-async def clear_all_stations():
-	"""Очистка всех станций зарядки"""
-	cleared_count = len(STATE["stations"])
-	STATE["stations"] = []
-	STATE["station_queues"] = {}
-	await persist_state()
-	return {"ok": True, "cleared": cleared_count}
-
-@app.delete("/api/stations/{station_index}")
-async def remove_station(station_index: int):
-	"""Удаление конкретной станции зарядки"""
-	try:
-		station_index = int(station_index)
-		if 0 <= station_index < len(STATE["stations"]):
-			removed_station = STATE["stations"].pop(station_index)
-			# Удаляем соответствующую очередь
-			if str(station_index) in STATE["station_queues"]:
-				del STATE["station_queues"][str(station_index)]
-			# Перенумеровываем оставшиеся очереди
-			new_queues = {}
-			for i, station in enumerate(STATE["stations"]):
-				old_key = str(i + 1) if i >= station_index else str(i)
-				if old_key in STATE["station_queues"]:
-					new_queues[str(i)] = STATE["station_queues"][old_key]
-			STATE["station_queues"] = new_queues
-			await persist_state()
-			return {"ok": True, "removed": removed_station}
-		else:
-			return JSONResponse(status_code=404, content={"ok": False, "error": "Station not found"})
-	except Exception as e:
-		return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
-
 @app.post("/api/orders")
 async def add_order(order: AddOrderRequest):
 	# Classify order type
@@ -353,40 +226,6 @@ async def add_order(order: AddOrderRequest):
 	end = await resolve_point(order.coords_to, order.address_to)
 	if not start or not end:
 		return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid start or end"})
-	
-	# Проверяем, существует ли указанный дрон
-	assigned_drone_id = None
-	if order.drone_id:
-		if order.drone_id in STATE["drones"]:
-			assigned_drone_id = order.drone_id
-		else:
-			return JSONResponse(status_code=400, content={"ok": False, "error": f"Drone {order.drone_id} not found"})
-	
-	# Обрабатываем промежуточные точки
-	processed_waypoints = []
-	if order.waypoints:
-		for wp in order.waypoints:
-			if isinstance(wp, dict):
-				coords = wp.get("coords")
-				address = wp.get("address")
-				wp_type = wp.get("type", "waypoint")
-				
-				# Разрешаем координаты
-				resolved_coords = await resolve_point(coords, address)
-				if resolved_coords:
-					processed_waypoints.append({
-						"coords": resolved_coords,
-						"address": address,
-						"type": wp_type
-					})
-			elif isinstance(wp, (list, tuple)) and len(wp) == 2:
-				# Старый формат для обратной совместимости
-				processed_waypoints.append({
-					"coords": tuple(wp),
-					"address": None,
-					"type": "waypoint"
-				})
-	
 	order_id = f"ord_{len(STATE['orders'])+1}"
 	entry = {
 		"id": order_id,
@@ -395,59 +234,15 @@ async def add_order(order: AddOrderRequest):
 		"end": end,
 		"battery_level": max(1.0, min(100.0, float(order.battery_level))),
 		"status": "queued",
-		"waypoints": processed_waypoints,
-		"drone_id": assigned_drone_id,
-		"priority": max(1, min(10, order.priority or 1)),
-		"created_at": datetime.utcnow().isoformat(),
+		"waypoints": [tuple(wp) for wp in (order.waypoints or []) if isinstance(wp, (list, tuple)) and len(wp)==2],
 	}
-	
-	# Добавляем в общий список заказов
 	STATE["orders"].append(entry)
-	
-	# Добавляем в соответствующую очередь для оптимизации
-	add_order_to_queue(entry)
-	
 	await persist_state()
 	return {"ok": True, "order": entry, "queue_size": len(STATE["orders"]) }
 
 @app.get("/api/orders")
 async def list_orders():
 	return STATE["orders"]
-
-@app.get("/api/order_queues")
-async def get_order_queues():
-	"""Получение информации об очередях заказов"""
-	queues_info = {}
-	for order_type, orders in STATE.get("order_queues", {}).items():
-		queues_info[order_type] = {
-			"count": len(orders),
-			"orders": orders[:10],  # Показываем только первые 10 заказов
-			"type_display": {
-				"delivery": "Доставка",
-				"shooting": "Съемка", 
-				"work": "Работа"
-			}.get(order_type, order_type)
-		}
-	return queues_info
-
-@app.post("/api/order_queues/{order_type}/optimize")
-async def optimize_order_queue_endpoint(order_type: str):
-	"""Оптимизация очереди заказов определенного типа"""
-	if order_type not in STATE.get("order_queues", {}):
-		return JSONResponse(status_code=404, content={"ok": False, "error": "Queue not found"})
-	
-	optimized_orders = optimize_order_queue(order_type)
-	STATE["order_queues"][order_type] = optimized_orders
-	await persist_state()
-	
-	return {"ok": True, "optimized_count": len(optimized_orders)}
-
-@app.post("/api/route_optimization")
-async def toggle_route_optimization(enabled: Dict[str, bool]):
-	"""Включение/выключение оптимизации маршрутов"""
-	STATE["route_optimization"] = enabled.get("enabled", True)
-	await persist_state()
-	return {"ok": True, "route_optimization": STATE["route_optimization"]}
 
 @app.post("/api/orders/{order_id}/cancel")
 async def cancel_order(order_id: str):
@@ -497,210 +292,11 @@ async def root_page():
 		return HTMLResponse("<h3>Client not found. Ensure static/index.html exists.</h3>", status_code=404)
 
 @app.post("/api/weather")
-async def set_weather(w: Dict[str, Any]):
+async def set_weather(w: Dict[str, float]):
 	wind = float(w.get("wind_mps", 3.0))
-	time_of_day = w.get("time_of_day", "day")
-	visibility = float(w.get("visibility", 10.0))
-	temperature = float(w.get("temperature", 20.0))
-	humidity = float(w.get("humidity", 60.0))
-	pressure = float(w.get("pressure", 1013.25))
-	cloud_cover = float(w.get("cloud_cover", 30.0))
-	precipitation = float(w.get("precipitation", 0.0))
-	uv_index = float(w.get("uv_index", 5.0))
-	
-	STATE["weather"] = {
-		"wind_mps": max(0.0, min(40.0, wind)),
-		"time_of_day": time_of_day if time_of_day in ["day", "night", "dawn", "dusk"] else "day",
-		"visibility": max(0.0, min(10.0, visibility)),
-		"temperature": max(-50.0, min(60.0, temperature)),
-		"humidity": max(0.0, min(100.0, humidity)),
-		"pressure": max(800.0, min(1100.0, pressure)),
-		"cloud_cover": max(0.0, min(100.0, cloud_cover)),
-		"precipitation": max(0.0, min(100.0, precipitation)),
-		"uv_index": max(0.0, min(15.0, uv_index)),
-		"last_updated": datetime.utcnow().isoformat()
-	}
+	STATE["weather"] = {"wind_mps": max(0.0, min(40.0, wind))}
 	await persist_state()
 	return {"ok": True, "weather": STATE["weather"]}
-
-@app.get("/api/weather")
-async def get_weather():
-	"""Получение текущей погоды"""
-	return {
-		"ok": True,
-		"weather": STATE["weather"],
-		"weather_impact": calculate_weather_impact()
-	}
-
-@app.post("/api/weather/update")
-async def update_weather_for_city():
-	"""Обновляет погоду для текущего города"""
-	city = STATE.get("city")
-	if not city:
-		return {"ok": False, "error": "Город не загружен"}
-	
-	try:
-		# Получаем реальные данные погоды для города
-		weather_data = await get_real_weather_data(city)
-		STATE["weather"] = weather_data
-		await persist_state()
-		return {"ok": True, "weather": STATE["weather"]}
-	except Exception as e:
-		logger.error(f"Ошибка получения погоды для {city}: {e}")
-		return {"ok": False, "error": str(e)}
-
-async def get_real_weather_data(city: str) -> Dict[str, Any]:
-	"""Получает реальные данные погоды для города"""
-	import random
-	
-	try:
-		# Для демонстрации используем случайные данные, но реалистичные для города
-		# В реальном проекте здесь был бы вызов к OpenWeatherMap API
-		
-		# Получаем координаты города для более точных данных
-		coords = _data_service.address_to_coords(city)
-		if not coords:
-			coords = [48.7080, 44.5133]  # Волгоград по умолчанию
-		
-		# Генерируем реалистичные данные погоды
-		base_temp = 20.0
-		if "москва" in city.lower() or "moscow" in city.lower():
-			base_temp = 15.0
-		elif "волгоград" in city.lower() or "volgograd" in city.lower():
-			base_temp = 22.0
-		elif "санкт" in city.lower() or "petersburg" in city.lower():
-			base_temp = 12.0
-		
-		# Добавляем случайные вариации
-		temperature = base_temp + random.uniform(-5, 10)
-		humidity = random.uniform(40, 80)
-		wind_speed = random.uniform(1, 8)
-		pressure = random.uniform(1000, 1030)
-		cloud_cover = random.uniform(10, 90)
-		precipitation = random.uniform(0, 20) if random.random() < 0.3 else 0
-		visibility = random.uniform(5, 15)
-		
-		# Определяем время дня
-		now = datetime.utcnow()
-		hour = now.hour
-		if 6 <= hour < 12:
-			time_of_day = "day"
-		elif 12 <= hour < 18:
-			time_of_day = "day"
-		elif 18 <= hour < 22:
-			time_of_day = "dusk"
-		else:
-			time_of_day = "night"
-		
-		return {
-			"wind_mps": round(wind_speed, 1),
-			"time_of_day": time_of_day,
-			"visibility": round(visibility, 1),
-			"temperature": round(temperature, 1),
-			"humidity": round(humidity, 1),
-			"pressure": round(pressure, 1),
-			"cloud_cover": round(cloud_cover, 1),
-			"precipitation": round(precipitation, 1),
-			"uv_index": round(random.uniform(1, 8), 1),
-			"last_updated": datetime.utcnow().isoformat(),
-			"city": city
-		}
-	except Exception as e:
-		logger.error(f"Ошибка получения погоды: {e}")
-		# Возвращаем данные по умолчанию
-		return {
-			"wind_mps": 3.0,
-			"time_of_day": "day",
-			"visibility": 10.0,
-			"temperature": 20.0,
-			"humidity": 60.0,
-			"pressure": 1013.25,
-			"cloud_cover": 30.0,
-			"precipitation": 0.0,
-			"uv_index": 5.0,
-			"last_updated": datetime.utcnow().isoformat(),
-			"city": city
-		}
-
-def calculate_weather_impact() -> Dict[str, Any]:
-	"""Вычисляет влияние погоды на полеты дронов"""
-	try:
-		weather = STATE.get("weather", {})
-		
-		# Оценка безопасности полетов (0-100, где 100 - идеальные условия)
-		safety_score = 100.0
-		
-		# Влияние ветра
-		wind = weather.get("wind_mps", 3.0)
-		if wind > 25.0:
-			safety_score -= 50  # Очень сильный ветер
-		elif wind > 15.0:
-			safety_score -= 30  # Сильный ветер
-		elif wind > 10.0:
-			safety_score -= 15  # Умеренный ветер
-		
-		# Влияние видимости
-		visibility = weather.get("visibility", 10.0)
-		if visibility < 1.0:
-			safety_score -= 40  # Очень плохая видимость
-		elif visibility < 3.0:
-			safety_score -= 25  # Плохая видимость
-		elif visibility < 5.0:
-			safety_score -= 10  # Сниженная видимость
-		
-		# Влияние осадков
-		precipitation = weather.get("precipitation", 0.0)
-		if precipitation > 50.0:
-			safety_score -= 30  # Сильные осадки
-		elif precipitation > 20.0:
-			safety_score -= 15  # Умеренные осадки
-		elif precipitation > 5.0:
-			safety_score -= 5   # Легкие осадки
-		
-		# Влияние времени дня
-		time_of_day = weather.get("time_of_day", "day")
-		if time_of_day == "night":
-			safety_score -= 10  # Ночные полеты сложнее
-		elif time_of_day in ["dawn", "dusk"]:
-			safety_score -= 5   # Сумерки
-		
-		# Влияние облачности
-		cloud_cover = weather.get("cloud_cover", 30.0)
-		if cloud_cover > 90.0:
-			safety_score -= 10  # Очень облачно
-		elif cloud_cover > 70.0:
-			safety_score -= 5   # Облачно
-		
-		safety_score = max(0.0, min(100.0, safety_score))
-		
-		# Определяем рекомендации
-		recommendations = []
-		if wind > 15.0:
-			recommendations.append("Ограничить полеты из-за сильного ветра")
-		if visibility < 3.0:
-			recommendations.append("Отложить полеты из-за плохой видимости")
-		if precipitation > 20.0:
-			recommendations.append("Избегать полетов во время осадков")
-		if time_of_day == "night":
-			recommendations.append("Использовать дополнительное освещение")
-		
-		return {
-			"safety_score": round(safety_score, 1),
-			"flight_recommended": safety_score >= 70.0,
-			"recommendations": recommendations,
-			"wind_impact": "high" if wind > 15.0 else "medium" if wind > 8.0 else "low",
-			"visibility_impact": "high" if visibility < 3.0 else "medium" if visibility < 5.0 else "low"
-		}
-		
-	except Exception as e:
-		logger.error(f"Ошибка вычисления влияния погоды: {e}")
-		return {
-			"safety_score": 50.0,
-			"flight_recommended": False,
-			"recommendations": ["Ошибка анализа погодных условий"],
-			"wind_impact": "unknown",
-			"visibility_impact": "unknown"
-		}
 
 # Base and inventory management
 class BaseConfig(BaseModel):
@@ -728,275 +324,6 @@ async def set_base(cfg: BaseConfig):
 @app.get("/api/base")
 async def get_base():
     return {"base": STATE["base"], "inventory": STATE["inventory"], "stations": STATE["stations"]}
-
-@app.get("/api/drones")
-async def get_drones():
-    """Получение списка всех дронов с их состоянием"""
-    drones_info = {}
-    for drone_id, drone in STATE["drones"].items():
-        drone_type = drone.get("type", "cargo")
-        drones_info[drone_id] = {
-            "pos": drone.get("pos"),
-            "type": drone_type,
-            "type_display": get_drone_type_display_name(drone_type),
-            "shape": get_drone_shape(drone_type),
-            "color": get_drone_color(drone_type),
-            "battery": drone.get("battery", 0),
-            "status": drone.get("status"),
-            "health": drone.get("health", 100),
-            "status_text": get_drone_status_text(drone),
-            "maintenance_hours": drone.get("maintenance_hours", 0),
-            "last_maintenance": drone.get("last_maintenance"),
-            "temp_c": drone.get("temp_c", 35),
-            "link_quality": drone.get("link_quality", 0.8),
-            "remaining_m": drone.get("remaining_m", 0),
-            "eta_s": drone.get("eta_s", 0),
-            "has_cargo": drone.get("has_cargo", False),
-            "cargo_type": drone.get("cargo_type"),
-            "cargo_weight": drone.get("cargo_weight", 0),
-        }
-    return drones_info
-
-@app.get("/api/drone_types")
-async def get_drone_types():
-    """Получение доступных типов дронов"""
-    available = get_available_drone_types()
-    types_info = {}
-    for drone_type, count in available.items():
-        types_info[drone_type] = {
-            "display_name": get_drone_type_display_name(drone_type),
-            "available_count": count,
-            "active_count": len([d for d in STATE["drones"].values() if d.get("type") == drone_type]),
-            "shape": get_drone_shape(drone_type),
-            "color": get_drone_color(drone_type)
-        }
-    return types_info
-
-def get_drone_shape(drone_type: str) -> str:
-    """Получает фигуру для отображения дрона на карте"""
-    shapes = {
-        "cargo": "circle",
-        "operator": "square", 
-        "cleaner": "triangle"
-    }
-    return shapes.get(drone_type, "circle")
-
-def get_drone_color(drone_type: str) -> str:
-    """Получает цвет для отображения дрона на карте"""
-    colors = {
-        "cargo": "#FF6B6B",  # Красный
-        "operator": "#4ECDC4",  # Бирюзовый
-        "cleaner": "#45B7D1"  # Синий
-    }
-    return colors.get(drone_type, "#95A5A6")  # Серый по умолчанию
-
-@app.post("/api/drones/{drone_id}/repair")
-async def repair_drone_endpoint(drone_id: str):
-    """Ремонт дрона"""
-    success = repair_drone(drone_id)
-    if success:
-        return {"ok": True, "message": f"Дрон {drone_id} отремонтирован"}
-    else:
-        return JSONResponse(status_code=404, content={"ok": False, "error": "Дрон не найден"})
-
-@app.get("/api/drones/{drone_id}/status")
-async def get_drone_status(drone_id: str):
-    """Получение детального статуса дрона"""
-    drone = STATE["drones"].get(drone_id)
-    if not drone:
-        return JSONResponse(status_code=404, content={"ok": False, "error": "Дрон не найден"})
-    
-    return {
-        "ok": True,
-        "drone_id": drone_id,
-        "status": drone.get("status"),
-        "health": drone.get("health", 100),
-        "battery": drone.get("battery", 0),
-        "status_text": get_drone_status_text(drone),
-        "maintenance_hours": drone.get("maintenance_hours", 0),
-        "last_maintenance": drone.get("last_maintenance"),
-        "pos": drone.get("pos"),
-        "type": drone.get("type"),
-        "temp_c": drone.get("temp_c", 35),
-        "link_quality": drone.get("link_quality", 0.8),
-        "remaining_m": drone.get("remaining_m", 0),
-        "eta_s": drone.get("eta_s", 0),
-    }
-
-class MultiPointRouteRequest(BaseModel):
-    points: List[Dict[str, Any]]  # [{"coords": [lat, lon], "address": "str", "type": "pickup|delivery|waypoint"}]
-    drone_id: Optional[str] = None
-    drone_type: str = "cargo"
-    battery_level: float = 100
-    priority: Optional[int] = 1
-
-@app.post("/api/routes/multi_point")
-async def create_multi_point_route(route: MultiPointRouteRequest):
-    """Создание маршрута с несколькими пунктами"""
-    try:
-        if len(route.points) < 2:
-            return JSONResponse(status_code=400, content={"ok": False, "error": "Необходимо минимум 2 пункта"})
-        
-        # Разрешаем координаты для всех пунктов
-        resolved_points = []
-        for i, point in enumerate(route.points):
-            coords = point.get("coords")
-            address = point.get("address")
-            point_type = point.get("type", "waypoint")
-            
-            resolved_coords = await resolve_point(coords, address)
-            if not resolved_coords:
-                return JSONResponse(status_code=400, content={"ok": False, "error": f"Не удалось разрешить пункт {i+1}"})
-            
-            resolved_points.append({
-                "coords": resolved_coords,
-                "type": point_type,
-                "address": address
-            })
-        
-        # Создаем заказы для каждого сегмента маршрута
-        created_orders = []
-        for i in range(len(resolved_points) - 1):
-            start_point = resolved_points[i]
-            end_point = resolved_points[i + 1]
-            
-            order_id = f"ord_{len(STATE['orders'])+1}"
-            order_entry = {
-                "id": order_id,
-                "type": "delivery" if end_point["type"] == "delivery" else "work",
-                "start": start_point["coords"],
-                "end": end_point["coords"],
-                "battery_level": route.battery_level,
-                "status": "queued",
-                "waypoints": [],
-                "drone_id": route.drone_id,
-                "priority": route.priority,
-                "created_at": datetime.utcnow().isoformat(),
-                "route_segment": i + 1,
-                "total_segments": len(resolved_points) - 1,
-                "multi_route_id": f"multi_{len(STATE['orders'])+1}"
-            }
-            
-            STATE["orders"].append(order_entry)
-            created_orders.append(order_entry)
-        
-        await persist_state()
-        return {
-            "ok": True, 
-            "orders": created_orders, 
-            "total_segments": len(resolved_points) - 1,
-            "message": f"Создан маршрут с {len(resolved_points)} пунктами"
-        }
-        
-    except Exception as e:
-        logger.error(f"Ошибка создания многопунктного маршрута: {e}")
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-@app.get("/api/routes/multi_point/{multi_route_id}")
-async def get_multi_point_route_status(multi_route_id: str):
-    """Получение статуса многопунктного маршрута"""
-    try:
-        orders = [o for o in STATE["orders"] if o.get("multi_route_id") == multi_route_id]
-        if not orders:
-            return JSONResponse(status_code=404, content={"ok": False, "error": "Маршрут не найден"})
-        
-        # Сортируем по сегментам
-        orders.sort(key=lambda x: x.get("route_segment", 0))
-        
-        return {
-            "ok": True,
-            "multi_route_id": multi_route_id,
-            "orders": orders,
-            "total_segments": len(orders),
-            "completed_segments": len([o for o in orders if o.get("status") == "completed"]),
-            "status": "completed" if all(o.get("status") == "completed" for o in orders) else "in_progress"
-        }
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения статуса маршрута: {e}")
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-class WaypointRequest(BaseModel):
-    coords: Optional[List[float]] = None
-    address: Optional[str] = None
-    type: str = "waypoint"  # pickup|delivery|waypoint
-    description: Optional[str] = None
-
-@app.post("/api/waypoints/resolve")
-async def resolve_waypoints(waypoints: List[WaypointRequest]):
-    """Разрешение промежуточных точек в координаты"""
-    try:
-        resolved_waypoints = []
-        
-        for i, wp in enumerate(waypoints):
-            coords = wp.coords
-            address = wp.address
-            wp_type = wp.type
-            description = wp.description
-            
-            # Разрешаем координаты
-            resolved_coords = await resolve_point(coords, address)
-            if not resolved_coords:
-                return JSONResponse(
-                    status_code=400, 
-                    content={"ok": False, "error": f"Не удалось разрешить точку {i+1}"}
-                )
-            
-            resolved_waypoints.append({
-                "coords": resolved_coords,
-                "address": address,
-                "type": wp_type,
-                "description": description
-            })
-        
-        return {
-            "ok": True,
-            "waypoints": resolved_waypoints,
-            "count": len(resolved_waypoints)
-        }
-        
-    except Exception as e:
-        logger.error(f"Ошибка разрешения промежуточных точек: {e}")
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-@app.get("/api/waypoints/types")
-async def get_waypoint_types():
-    """Получение доступных типов промежуточных точек"""
-    return {
-        "ok": True,
-        "types": {
-            "pickup": {
-                "name": "Забор груза",
-                "description": "Точка забора груза или пассажира",
-                "icon": "📦",
-                "color": "#FF6B6B"
-            },
-            "delivery": {
-                "name": "Доставка",
-                "description": "Точка доставки груза",
-                "icon": "🚚",
-                "color": "#4ECDC4"
-            },
-            "waypoint": {
-                "name": "Промежуточная точка",
-                "description": "Обычная промежуточная точка маршрута",
-                "icon": "📍",
-                "color": "#95A5A6"
-            },
-            "inspection": {
-                "name": "Инспекция",
-                "description": "Точка для осмотра или проверки",
-                "icon": "🔍",
-                "color": "#F39C12"
-            },
-            "charging": {
-                "name": "Зарядка",
-                "description": "Точка зарядки дрона",
-                "icon": "🔋",
-                "color": "#9B59B6"
-            }
-        }
-    }
 
 class StationsConfig(BaseModel):
     stations: List[Tuple[float, float]]
@@ -1063,43 +390,26 @@ async def assign_orders():
 	G = STATE.get("city_graph")
 	if not city or G is None:
 		return
-	
-	# Обрабатываем заказы по типам
-	for order_type in ["delivery", "shooting", "work"]:
-		# Получаем следующий заказ из оптимизированной очереди
-		order = get_next_order_from_queue(order_type)
-		if not order:
-			continue
-		
-		# Проверяем, что заказ еще в статусе "queued"
-		if order.get("status") != "queued":
-			continue
-		# Если указан конкретный дрон, используем его
-		if order.get("drone_id"):
-			drone_id = order["drone_id"]
-			drone = STATE["drones"].get(drone_id)
-			if not drone:
-				logger.warning(f"Указанный дрон {drone_id} не найден для заказа {order['id']}")
-				continue
-			
-			# Проверяем, что дрон свободен и в хорошем состоянии
-			if (drone.get("status") not in ("idle", "charging") or 
-			    drone.get("health", 100) < 50 or 
-			    drone.get("battery", 0) < 20):
-				logger.warning(f"Указанный дрон {drone_id} недоступен для заказа {order['id']}")
-				continue
-		else:
-			# Определяем требуемый тип дрона
-			required_type = map_order_to_drone_type(order["type"])
-			
-			# Ищем доступного дрона нужного типа
-			drone_id = pick_drone_for_order_by_type(order, required_type)
+	queue = [o for o in STATE["orders"] if o.get("status") == "queued"]
+	for order in queue:
+		# Choose drone: nearest idle or create new
+		drone_id = pick_drone_for_order(order)
+		if drone_id is None:
+			# Try spawn from inventory at base
+			pref_type = map_order_to_drone_type(order["type"])
+			drone_id = spawn_drone_from_inventory(pref_type)
 			if drone_id is None:
-				logger.warning(f"Нет доступных дронов типа {required_type} для заказа {order['id']}. Заказ остается в очереди.")
-				continue
-		
+				# fallback: create at order start
+				drone_id = f"drone_{len(STATE['drones'])+1}"
+				STATE["drones"][drone_id] = {
+					"pos": order["start"],
+					"type": pref_type,
+					"battery": order["battery_level"],
+					"route": [],
+					"target_idx": 0,
+					"status": "idle",
+				}
 		# Plan route with energy-aware via base/stations
-		waypoints = order.get("waypoints", [])
 		path, coords, length = plan_via_base_if_needed(order["start"], order["end"], STATE["drones"][drone_id]["type"], STATE["drones"][drone_id]["battery"])
 		if coords:
 			# Ensure the drone stops at the first charger on the way and charges before continuing
@@ -1107,7 +417,6 @@ async def assign_orders():
 			order["status"] = "assigned"
 			order["drone_id"] = drone_id
 			order["route_length"] = length
-			logger.info(f"Заказ {order['id']} назначен дрону {drone_id} типа {STATE['drones'][drone_id]['type']}")
 
 def pick_drone_for_order(order: Dict[str, Any]) -> Optional[str]:
 	# pick nearest idle drone; return None if none
@@ -1119,29 +428,6 @@ def pick_drone_for_order(order: Dict[str, Any]) -> Optional[str]:
 			if dist < best_dist:
 				best_dist = dist
 				best = drone_id
-	return best
-
-def pick_drone_for_order_by_type(order: Dict[str, Any], required_type: str) -> Optional[str]:
-	"""Выбирает ближайшего свободного дрона определенного типа"""
-	best = None
-	best_dist = float('inf')
-	
-	for drone_id, d in STATE["drones"].items():
-		# Проверяем тип дрона
-		if d.get("type") != required_type:
-			continue
-			
-		# Проверяем статус и состояние
-		if (d.get("status") in (None, "idle", "charging") and 
-		    d.get("pos") and 
-		    d.get("health", 100) > 50 and 
-		    d.get("battery", 0) > 20):
-			
-			dist = haversine_m(d["pos"], order["start"])
-			if dist < best_dist:
-				best_dist = dist
-				best = drone_id
-	
 	return best
 
 
@@ -1158,14 +444,9 @@ def plan_route_for(start: Tuple[float, float], end: Tuple[float, float], drone_t
 	G = STATE.get("city_graph")
 	if not city or G is None:
 		return None, None, 0.0
-	
-	# Применяем погодные условия к графу
-	G = apply_weather_conditions(G, drone_type)
-	
 	# ensure routing service has this graph
 	_routing_service.city_graphs[city] = G
 	max_range = _routing_service._get_drone_params(drone_type).get('battery_range', 20000) * (battery_level/100.0)
-	
 	# Use door-to-door planner with temporary nodes
 	path, coords, length = _routing_service.plan_direct_path(G, start, end, max_range, waypoints=waypoints)
 	if path:
@@ -1259,17 +540,6 @@ def simulate_step():
 	if not city or G is None:
 		return
 	for drone_id, drone in STATE["drones"].items():
-		# Проверяем здоровье дрона
-		if not check_drone_health(drone_id, drone):
-			# Если дрон сломался, пытаемся передать заказ другому дрону
-			handover_order_if_needed(drone_id)
-			continue
-		
-		# Если дрон требует обслуживания, направляем на базу
-		if drone.get("status") == "needs_maintenance":
-			maybe_route_to_base_or_station(drone)
-			continue
-		
 		if drone.get("status") != "enroute":
 			continue
 		route = drone.get("route") or []
@@ -1278,20 +548,9 @@ def simulate_step():
 			# Order considered complete if present
 			drone["status"] = "idle"
 			mark_order_completed_if_any(drone_id)
-			
-			# Проверяем, есть ли у дрона груз
-			has_cargo = check_drone_has_cargo(drone_id)
-			
-			# If low battery after completing, head to base or station
+			# If low battery after completing, head to base
 			if drone.get("battery", 100.0) < 30.0:
-				if has_cargo:
-					# Дрон с грузом летит на станцию зарядки
-					route_to_charging_station_with_cargo(drone)
-				else:
-					maybe_route_to_base_or_station(drone)
-			else:
-				# Если батарея в порядке, строим оптимальный маршрут до базы
-				route_to_base_optimal(drone_id)
+				maybe_route_to_base_or_station(drone)
 			continue
 		current = drone["pos"]
 		target = route[idx]
@@ -1338,20 +597,10 @@ def simulate_step():
 		compute_link_quality(drone)
 		# low battery behavior: route to nearest charger when under thresholds
 		if drone["battery"] <= 5.0:
-			# Проверяем, можем ли долететь до ближайшей станции зарядки
-			if can_reach_charging_station(drone):
-				drone["status"] = "emergency_charging"
-				maybe_route_to_base_or_station(drone)
-			else:
-				# Если не можем долететь, пытаемся передать заказ
-				handover_order_if_needed(drone_id)
-				drone["status"] = "low_battery"
+			drone["status"] = "low_battery"
+			maybe_route_to_base_or_station(drone)
 		elif drone["battery"] <= 20.0 and drone.get("status") in ("idle", "holding"):
 			maybe_route_to_base_or_station(drone)
-		elif drone["battery"] <= 15.0 and drone.get("status") == "enroute":
-			# При очень низком заряде во время полета пытаемся передать заказ
-			if not can_reach_charging_station(drone):
-				handover_order_if_needed(drone_id)
 
 		# Update ETA approximation (seconds) and readable remaining distance
 		try:
@@ -1549,27 +798,14 @@ def progress_charging():
             d["battery"] = min(100.0, float(d.get("battery", 0.0)) + 4.0)
             if d["battery"] >= 100.0:
                 done.append(did)
-                # Проверяем, есть ли у дрона груз
-                if d.get("has_cargo", False):
-                    # Дрон с грузом продолжает маршрут
-                    resume = d.get("resume_route") or []
-                    if resume:
-                        d["route"] = list(resume)
-                        d["resume_route"] = []
-                        d["target_idx"] = 0
-                        d["status"] = "enroute"
-                    else:
-                        d["status"] = "idle"
+                resume = d.get("resume_route") or []
+                if resume:
+                    d["route"] = list(resume)
+                    d["resume_route"] = []
+                    d["target_idx"] = 0
+                    d["status"] = "enroute"
                 else:
-                    # Обычный дрон
-                    resume = d.get("resume_route") or []
-                    if resume:
-                        d["route"] = list(resume)
-                        d["resume_route"] = []
-                        d["target_idx"] = 0
-                        d["status"] = "enroute"
-                    else:
-                        d["status"] = "idle"
+                    d["status"] = "idle"
         for did in done:
             if did in sq["charging"]:
                 sq["charging"].remove(did)
@@ -1584,448 +820,6 @@ def mark_order_completed_if_any(drone_id: str):
         if o.get("drone_id") == drone_id and o.get("status") == "assigned":
             o["status"] = "completed"
             break
-
-def check_drone_health(drone_id: str, drone: Dict[str, Any]):
-    """Проверка состояния дрона и обновление здоровья"""
-    try:
-        # Увеличиваем часы работы
-        drone["maintenance_hours"] += 1.0 / 3600.0  # 1 секунда = 1/3600 часа
-        
-        # Проверяем вероятность поломки
-        import random
-        if random.random() < drone["malfunction_probability"] * (1.0 / 3600.0):  # за секунду
-            drone["health"] = max(0.0, drone["health"] - random.uniform(5.0, 15.0))
-            if drone["health"] <= 0:
-                drone["status"] = "malfunction"
-                drone["health"] = 0.0
-                logger.warning(f"Дрон {drone_id} сломался!")
-                return False
-        
-        # Ухудшение здоровья со временем
-        if drone["maintenance_hours"] > 100:  # после 100 часов работы
-            health_degradation = (drone["maintenance_hours"] - 100) * 0.1
-            drone["health"] = max(0.0, 100.0 - health_degradation)
-        
-        # Если здоровье критически низкое
-        if drone["health"] < 20.0 and drone["status"] not in ["malfunction", "maintenance"]:
-            drone["status"] = "needs_maintenance"
-            logger.warning(f"Дрон {drone_id} требует обслуживания! Здоровье: {drone['health']:.1f}%")
-        
-        return drone["health"] > 0
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки здоровья дрона {drone_id}: {e}")
-        return True
-
-def get_drone_status_text(drone: Dict[str, Any]) -> str:
-    """Получение текстового описания состояния дрона"""
-    if drone["health"] <= 0:
-        return "Поломка"
-    elif drone["status"] == "malfunction":
-        return "Поломка"
-    elif drone["status"] == "needs_maintenance":
-        return "Требует обслуживания"
-    elif drone["status"] == "maintenance":
-        return "На обслуживании"
-    elif drone["status"] == "emergency_charging":
-        return "Экстренная зарядка"
-    elif drone["status"] == "charging_with_cargo":
-        return "Зарядка с грузом"
-    elif drone["status"] == "returning_to_base":
-        return "Возвращается на базу"
-    elif drone.get("has_cargo", False):
-        return "С грузом"
-    elif drone["battery"] <= 5:
-        return "Критически низкий заряд"
-    elif drone["battery"] <= 20:
-        return "Низкий заряд"
-    elif drone["health"] < 50:
-        return "Плохое состояние"
-    elif drone["health"] < 80:
-        return "Удовлетворительное состояние"
-    else:
-        return "В норме"
-
-def repair_drone(drone_id: str) -> bool:
-    """Ремонт дрона"""
-    try:
-        drone = STATE["drones"].get(drone_id)
-        if not drone:
-            return False
-        
-        drone["health"] = 100.0
-        drone["maintenance_hours"] = 0.0
-        drone["last_maintenance"] = datetime.utcnow().isoformat()
-        drone["status"] = "idle"
-        logger.info(f"Дрон {drone_id} отремонтирован")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка ремонта дрона {drone_id}: {e}")
-        return False
-
-def apply_weather_conditions(G, drone_type: str):
-    """Применяет погодные условия к графу для планирования маршрута"""
-    try:
-        import copy
-        G = copy.deepcopy(G)  # Создаем копию графа
-        
-        weather = STATE.get("weather", {})
-        wind_mps = weather.get("wind_mps", 3.0)
-        time_of_day = weather.get("time_of_day", "day")
-        visibility = weather.get("visibility", 10.0)
-        
-        # Получаем параметры дрона
-        drone_params = {
-            "cargo": {"max_altitude": 200, "wind_resistance": 0.8},
-            "operator": {"max_altitude": 150, "wind_resistance": 0.6},
-            "cleaner": {"max_altitude": 100, "wind_resistance": 0.4}
-        }.get(drone_type, {"max_altitude": 200, "wind_resistance": 0.8})
-        
-        # Применяем ветровые условия
-        wind_factor = 1.0 + (wind_mps * 0.1 * (1.0 - drone_params["wind_resistance"]))
-        
-        # Применяем условия видимости
-        visibility_factor = 1.0 + (10.0 - visibility) * 0.05
-        
-        # Применяем время дня
-        time_factor = 1.0
-        if time_of_day == "night":
-            time_factor = 1.2  # Ночью сложнее летать
-        elif time_of_day == "dawn" or time_of_day == "dusk":
-            time_factor = 1.1  # В сумерках немного сложнее
-        
-        # Обновляем веса рёбер
-        for u, v, data in G.edges(data=True):
-            if 'weight' in data:
-                # Увеличиваем вес рёбер в зависимости от условий
-                data['weight'] *= wind_factor * visibility_factor * time_factor
-                
-                # Блокируем рёбра при экстремальных условиях
-                if wind_mps > 25.0:  # Сильный ветер
-                    data['weight'] = float('inf')
-                elif visibility < 1.0:  # Очень плохая видимость
-                    data['weight'] = float('inf')
-        
-        # Применяем ограничения по высоте зданий
-        G = apply_building_height_restrictions(G, drone_params["max_altitude"])
-        
-        return G
-        
-    except Exception as e:
-        logger.error(f"Ошибка применения погодных условий: {e}")
-        return G
-
-def apply_building_height_restrictions(G, max_altitude: float):
-    """Применяет ограничения по высоте зданий"""
-    try:
-        # Получаем данные о зданиях из графа
-        for node, attr in G.nodes(data=True):
-            if attr.get('type') == 'cleaner' and 'building_id' in attr:
-                # Для дронов-уборщиков проверяем высоту зданий
-                building_height = estimate_building_height(attr.get('building_id', 0))
-                if building_height > max_altitude:
-                    # Блокируем узел если здание слишком высокое
-                    attr['weight'] = float('inf')
-        
-        return G
-        
-    except Exception as e:
-        logger.error(f"Ошибка применения ограничений по высоте: {e}")
-        return G
-
-def estimate_building_height(building_id: int) -> float:
-    """Оценивает высоту здания (заглушка)"""
-    import random
-    # В реальной реализации здесь была бы логика получения высоты здания
-    # Пока используем случайную высоту от 10 до 200 метров
-    return random.uniform(10.0, 200.0)
-
-def check_drone_has_cargo(drone_id: str) -> bool:
-    """Проверяет, есть ли у дрона груз"""
-    try:
-        drone = STATE["drones"].get(drone_id)
-        if not drone:
-            return False
-        
-        # Ищем активные заказы доставки для этого дрона
-        for order in STATE.get("orders", []):
-            if (order.get("drone_id") == drone_id and 
-                order.get("status") == "assigned" and 
-                order.get("type") == "delivery"):
-                return True
-        
-        # Проверяем, есть ли груз в данных дрона
-        return drone.get("has_cargo", False)
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки груза дрона {drone_id}: {e}")
-        return False
-
-def route_to_charging_station_with_cargo(drone: Dict[str, Any]):
-    """Направляет дрон с грузом на станцию зарядки"""
-    try:
-        # Ищем ближайшую станцию зарядки (не базу, так как там может не быть места для груза)
-        stations = STATE.get("stations", [])
-        if not stations:
-            # Если нет станций, летим на базу
-            maybe_route_to_base_or_station(drone)
-            return
-        
-        pos = tuple(drone.get("pos", (0, 0)))
-        best_station = None
-        best_distance = float('inf')
-        
-        for station in stations:
-            distance = haversine_m(pos, tuple(station))
-            if distance < best_distance:
-                best_distance = distance
-                best_station = station
-        
-        if best_station:
-            _, coords, _ = plan_route_for(pos, tuple(best_station), drone["type"], drone["battery"])
-            if coords:
-                drone["route"] = coords
-                drone["target_idx"] = 0
-                drone["status"] = "charging_with_cargo"
-                logger.info(f"Дрон {drone.get('id', 'unknown')} с грузом направлен на станцию зарядки")
-        
-    except Exception as e:
-        logger.error(f"Ошибка направления дрона с грузом на зарядку: {e}")
-
-def unload_cargo_at_station(drone_id: str):
-    """Разгружает груз на станции"""
-    try:
-        drone = STATE["drones"].get(drone_id)
-        if not drone:
-            return False
-        
-        # Помечаем, что груз разгружен
-        drone["has_cargo"] = False
-        drone["cargo_type"] = None
-        drone["cargo_weight"] = 0
-        
-        logger.info(f"Груз разгружен с дрона {drone_id}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Ошибка разгрузки груза: {e}")
-        return False
-
-def load_cargo_for_delivery(drone_id: str, order_id: str):
-    """Загружает груз для доставки"""
-    try:
-        drone = STATE["drones"].get(drone_id)
-        order = None
-        
-        # Находим заказ
-        for o in STATE.get("orders", []):
-            if o.get("id") == order_id:
-                order = o
-                break
-        
-        if not drone or not order:
-            return False
-        
-        # Загружаем груз
-        drone["has_cargo"] = True
-        drone["cargo_type"] = order.get("type", "delivery")
-        drone["cargo_weight"] = 1.0  # кг
-        drone["cargo_order_id"] = order_id
-        
-        logger.info(f"Груз загружен на дрон {drone_id} для заказа {order_id}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Ошибка загрузки груза: {e}")
-        return False
-
-def can_reach_charging_station(drone: Dict[str, Any]) -> bool:
-    """Проверяет, может ли дрон долететь до ближайшей станции зарядки с текущим зарядом"""
-    try:
-        pos = tuple(drone.get("pos", (0, 0)))
-        battery = drone.get("battery", 0)
-        drone_type = drone.get("type", "cargo")
-        
-        # Получаем параметры дрона
-        per = {
-            "cargo": 2000.0,
-            "operator": 2500.0,
-            "cleaner": 3000.0,
-        }.get(drone_type, 2000.0)
-        
-        # Вычисляем максимальную дальность с текущим зарядом
-        max_range = per * (battery / 100.0)
-        
-        # Ищем ближайшую станцию зарядки
-        chargers = []
-        if STATE.get("base"):
-            chargers.append(tuple(STATE["base"]))
-        chargers += [tuple(s) for s in STATE.get("stations", []) if isinstance(s, (list, tuple)) and len(s)==2]
-        
-        if not chargers:
-            return False
-        
-        # Проверяем, можем ли долететь до любой станции
-        for charger in chargers:
-            distance = haversine_m(pos, charger)
-            if distance <= max_range:
-                return True
-        
-        return False
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки доступности станции зарядки: {e}")
-        return False
-
-def handover_order_if_needed(broken_drone_id: str):
-    """Передача заказа другому дрону при поломке или низком заряде"""
-    try:
-        # Находим заказ, назначенный сломанному дрону
-        order_to_handover = None
-        for order in STATE.get("orders", []):
-            if order.get("drone_id") == broken_drone_id and order.get("status") == "assigned":
-                order_to_handover = order
-                break
-        
-        if not order_to_handover:
-            return False
-        
-        # Ищем ближайший свободный дрон
-        broken_drone = STATE["drones"].get(broken_drone_id)
-        if not broken_drone:
-            return False
-        
-        best_drone_id = find_best_replacement_drone(broken_drone, order_to_handover)
-        
-        if best_drone_id:
-            # Передаем заказ новому дрону
-            success = transfer_order_to_drone(order_to_handover, best_drone_id)
-            if success:
-                logger.info(f"Заказ {order_to_handover['id']} передан дрону {best_drone_id}")
-                return True
-        
-        # Если не нашли подходящий дрон, отменяем заказ
-        order_to_handover["status"] = "cancelled"
-        order_to_handover["drone_id"] = None
-        logger.warning(f"Заказ {order_to_handover['id']} отменен - нет доступных дронов")
-        return False
-        
-    except Exception as e:
-        logger.error(f"Ошибка передачи заказа: {e}")
-        return False
-
-def find_best_replacement_drone(broken_drone: Dict[str, Any], order: Dict[str, Any]) -> Optional[str]:
-    """Находит лучшего дрона для замены"""
-    try:
-        best_drone_id = None
-        best_score = float('inf')
-        
-        for drone_id, drone in STATE["drones"].items():
-            if drone_id == order.get("drone_id"):
-                continue
-            
-            # Проверяем базовые требования
-            if not is_drone_available_for_order(drone, order):
-                continue
-            
-            # Вычисляем оценку пригодности дрона
-            score = calculate_drone_suitability_score(drone, broken_drone, order)
-            
-            if score < best_score:
-                best_score = score
-                best_drone_id = drone_id
-        
-        return best_drone_id
-        
-    except Exception as e:
-        logger.error(f"Ошибка поиска замены дрона: {e}")
-        return None
-
-def is_drone_available_for_order(drone: Dict[str, Any], order: Dict[str, Any]) -> bool:
-    """Проверяет, доступен ли дрон для заказа"""
-    try:
-        # Проверяем статус
-        if drone.get("status") not in ("idle", "charging"):
-            return False
-        
-        # Проверяем здоровье
-        if drone.get("health", 100) < 50:
-            return False
-        
-        # Проверяем заряд
-        if drone.get("battery", 0) < 20:
-            return False
-        
-        # Проверяем тип дрона (если заказ требует конкретный тип)
-        required_type = map_order_to_drone_type(order.get("type", "work"))
-        if drone.get("type") != required_type:
-            return False
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки доступности дрона: {e}")
-        return False
-
-def calculate_drone_suitability_score(drone: Dict[str, Any], broken_drone: Dict[str, Any], order: Dict[str, Any]) -> float:
-    """Вычисляет оценку пригодности дрона для заказа"""
-    try:
-        score = 0.0
-        
-        # Расстояние до точки забора груза
-        distance = haversine_m(drone["pos"], order["start"])
-        score += distance * 0.1  # 0.1 балла за метр
-        
-        # Обратный заряд (чем больше, тем лучше)
-        battery = drone.get("battery", 0)
-        score += (100 - battery) * 0.01  # 0.01 балла за каждый % разряда
-        
-        # Обратное здоровье (чем больше, тем лучше)
-        health = drone.get("health", 100)
-        score += (100 - health) * 0.02  # 0.02 балла за каждый % износа
-        
-        # Штраф за дрона с грузом
-        if drone.get("has_cargo", False):
-            score += 1000.0
-        
-        return score
-        
-    except Exception as e:
-        logger.error(f"Ошибка вычисления оценки дрона: {e}")
-        return float('inf')
-
-def transfer_order_to_drone(order: Dict[str, Any], new_drone_id: str) -> bool:
-    """Передает заказ новому дрону"""
-    try:
-        new_drone = STATE["drones"].get(new_drone_id)
-        if not new_drone:
-            return False
-        
-        # Обновляем заказ
-        order["drone_id"] = new_drone_id
-        order["status"] = "assigned"
-        
-        # Планируем маршрут для нового дрона
-        start = order["start"]
-        end = order["end"]
-        waypoints = order.get("waypoints", [])
-        
-        path, coords, length = plan_route_for(start, end, new_drone["type"], new_drone["battery"], waypoints)
-        if coords:
-            apply_midroute_charging(new_drone, coords)
-            new_drone["status"] = "enroute"
-            
-            # Если это заказ доставки, загружаем груз
-            if order.get("type") == "delivery":
-                load_cargo_for_delivery(new_drone_id, order["id"])
-            
-            return True
-        
-        return False
-        
-    except Exception as e:
-        logger.error(f"Ошибка передачи заказа дрону: {e}")
-        return False
 
 # Telemetry helpers
 def compute_link_quality(drone: Dict[str, Any]):
@@ -2050,20 +844,16 @@ def compute_link_quality(drone: Dict[str, Any]):
         drone["link_quality"] = 0.5
 
 def ensure_base_drones():
-    """Создает дронов на базе согласно инвентарю. Удаляет старых дронов и создает новых."""
     base = STATE.get("base")
     inv = STATE.get("inventory") or {}
     if not base or not isinstance(inv, dict):
         return
-    
-    # Очищаем существующих дронов
-    STATE["drones"] = {}
-    
-    # Создаем дронов согласно инвентарю
+    # If there are already drones, do not auto-spawn duplicates
+    if STATE.get("drones"):
+        return
     total = sum(max(0, int(v)) for v in inv.values())
     if total <= 0:
         return
-    
     for typ, cnt in inv.items():
         try:
             n = max(0, int(cnt))
@@ -2071,8 +861,6 @@ def ensure_base_drones():
             n = 0
         for _ in range(n):
             spawn_drone(typ, pos=tuple(base), battery=100.0)
-    
-    logger.info(f"Создано {total} дронов на базе согласно инвентарю")
 
 def spawn_drone(drone_type: str, pos: Tuple[float, float], battery: float = 100.0) -> str:
     did = f"drone_{len(STATE['drones'])+1}"
@@ -2083,15 +871,6 @@ def spawn_drone(drone_type: str, pos: Tuple[float, float], battery: float = 100.
         "route": [],
         "target_idx": 0,
         "status": "idle",
-        "health": 100.0,  # 0-100, 0 = поломка
-        "maintenance_hours": 0.0,  # накопленные часы работы
-        "last_maintenance": datetime.utcnow().isoformat(),
-        "malfunction_probability": 0.01,  # вероятность поломки за час
-        "temp_c": 35.0,
-        "link_quality": 0.8,
-        "remaining_m": 0.0,
-        "eta_s": 0,
-        "history": [],
     }
     return did
 
@@ -2112,230 +891,8 @@ def spawn_drone_from_inventory(pref_type: str) -> Optional[str]:
             did = spawn_drone(t, pos=tuple(base), battery=100.0)
             inv[t] = cnt - 1
             STATE["inventory"] = inv
-            logger.info(f"Создан дрон {did} типа {t} из инвентаря")
             return did
     return None
-
-def get_available_drone_types() -> Dict[str, int]:
-    """Получает доступные типы дронов из инвентаря"""
-    inv = STATE.get("inventory", {})
-    available = {}
-    for drone_type in ("cargo", "operator", "cleaner"):
-        count = inv.get(drone_type, 0)
-        try:
-            count = int(count)
-        except Exception:
-            count = 0
-        available[drone_type] = count
-    return available
-
-def get_drone_type_display_name(drone_type: str) -> str:
-    """Получает отображаемое имя типа дрона"""
-    names = {
-        "cargo": "Грузовой",
-        "operator": "Операторский", 
-        "cleaner": "Уборочный"
-    }
-    return names.get(drone_type, drone_type)
-
-def calculate_route_efficiency(start: Tuple[float, float], end: Tuple[float, float], drone_type: str) -> float:
-    """Вычисляет эффективность маршрута (чем меньше, тем лучше)"""
-    try:
-        # Прямое расстояние
-        direct_distance = haversine_m(start, end)
-        
-        # Планируем маршрут
-        path, coords, length = plan_route_for(start, end, drone_type, 100.0)
-        if not coords:
-            return float('inf')
-        
-        # Коэффициент эффективности (отношение прямого расстояния к длине маршрута)
-        efficiency = direct_distance / length if length > 0 else 1.0
-        
-        # Учитываем сложность маршрута (количество поворотов)
-        complexity_factor = 1.0 + (len(coords) - 2) * 0.1
-        
-        return efficiency * complexity_factor
-        
-    except Exception as e:
-        logger.error(f"Ошибка вычисления эффективности маршрута: {e}")
-        return float('inf')
-
-def optimize_order_queue(order_type: str) -> List[Dict[str, Any]]:
-    """Оптимизирует очередь заказов определенного типа"""
-    try:
-        if not STATE.get("route_optimization", True):
-            return STATE.get("order_queues", {}).get(order_type, [])
-        
-        orders = STATE.get("order_queues", {}).get(order_type, [])
-        if len(orders) <= 1:
-            return orders
-        
-        # Сортируем заказы по приоритету и времени создания
-        orders.sort(key=lambda x: (x.get("priority", 1), x.get("created_at", "")), reverse=True)
-        
-        # Группируем заказы по близости
-        optimized_orders = []
-        used_orders = set()
-        
-        for i, order in enumerate(orders):
-            if order["id"] in used_orders:
-                continue
-                
-            optimized_orders.append(order)
-            used_orders.add(order["id"])
-            
-            # Ищем близкие заказы для группировки
-            start_pos = order["start"]
-            for j, other_order in enumerate(orders[i+1:], i+1):
-                if other_order["id"] in used_orders:
-                    continue
-                    
-                other_start = other_order["start"]
-                distance = haversine_m(start_pos, other_start)
-                
-                # Если заказы близко друг к другу, группируем их
-                if distance < 1000:  # 1км
-                    optimized_orders.append(other_order)
-                    used_orders.add(other_order["id"])
-        
-        return optimized_orders
-        
-    except Exception as e:
-        logger.error(f"Ошибка оптимизации очереди заказов: {e}")
-        return STATE.get("order_queues", {}).get(order_type, [])
-
-def add_order_to_queue(order: Dict[str, Any]):
-    """Добавляет заказ в соответствующую очередь"""
-    try:
-        order_type = order.get("type", "work")
-        if order_type not in STATE["order_queues"]:
-            STATE["order_queues"][order_type] = []
-        
-        STATE["order_queues"][order_type].append(order)
-        
-        # Оптимизируем очередь
-        STATE["order_queues"][order_type] = optimize_order_queue(order_type)
-        
-    except Exception as e:
-        logger.error(f"Ошибка добавления заказа в очередь: {e}")
-
-def get_next_order_from_queue(order_type: str) -> Optional[Dict[str, Any]]:
-    """Получает следующий заказ из очереди"""
-    try:
-        queue = STATE.get("order_queues", {}).get(order_type, [])
-        if not queue:
-            return None
-        
-        # Берем первый заказ из оптимизированной очереди
-        order = queue.pop(0)
-        STATE["order_queues"][order_type] = queue
-        
-        return order
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения заказа из очереди: {e}")
-        return None
-
-def route_to_base_optimal(drone_id: str):
-    """Строит оптимальный маршрут до базы для дрона"""
-    try:
-        drone = STATE["drones"].get(drone_id)
-        if not drone:
-            return
-        
-        base = STATE.get("base")
-        if not base:
-            return
-        
-        # Проверяем, есть ли новые заказы поблизости
-        nearby_orders = find_nearby_orders(drone["pos"], drone["type"])
-        if nearby_orders:
-            # Если есть заказы поблизости, берем ближайший
-            nearest_order = nearby_orders[0]
-            assign_order_to_drone(nearest_order, drone_id)
-            return
-        
-        # Если нет заказов, строим оптимальный маршрут до базы
-        current_pos = drone["pos"]
-        drone_type = drone["type"]
-        battery = drone["battery"]
-        
-        # Планируем маршрут до базы
-        path, coords, length = plan_route_for(current_pos, tuple(base), drone_type, battery)
-        if coords:
-            drone["route"] = coords
-            drone["target_idx"] = 0
-            drone["status"] = "returning_to_base"
-            logger.info(f"Дрон {drone_id} возвращается на базу")
-        
-    except Exception as e:
-        logger.error(f"Ошибка построения оптимального маршрута до базы: {e}")
-
-def find_nearby_orders(position: Tuple[float, float], drone_type: str, max_distance: float = 5000.0) -> List[Dict[str, Any]]:
-    """Находит заказы поблизости от дрона"""
-    try:
-        nearby_orders = []
-        required_type = drone_type
-        
-        for order in STATE.get("orders", []):
-            if order.get("status") != "queued":
-                continue
-            
-            # Проверяем тип заказа
-            order_type = map_order_to_drone_type(order.get("type", "work"))
-            if order_type != required_type:
-                continue
-            
-            # Проверяем расстояние
-            distance = haversine_m(position, order["start"])
-            if distance <= max_distance:
-                nearby_orders.append({
-                    "order": order,
-                    "distance": distance
-                })
-        
-        # Сортируем по расстоянию
-        nearby_orders.sort(key=lambda x: x["distance"])
-        return [item["order"] for item in nearby_orders]
-        
-    except Exception as e:
-        logger.error(f"Ошибка поиска заказов поблизости: {e}")
-        return []
-
-def assign_order_to_drone(order: Dict[str, Any], drone_id: str) -> bool:
-    """Назначает заказ дрону"""
-    try:
-        drone = STATE["drones"].get(drone_id)
-        if not drone:
-            return False
-        
-        # Обновляем заказ
-        order["drone_id"] = drone_id
-        order["status"] = "assigned"
-        
-        # Планируем маршрут
-        start = order["start"]
-        end = order["end"]
-        waypoints = order.get("waypoints", [])
-        
-        path, coords, length = plan_route_for(start, end, drone["type"], drone["battery"], waypoints)
-        if coords:
-            apply_midroute_charging(drone, coords)
-            drone["status"] = "enroute"
-            
-            # Если это заказ доставки, загружаем груз
-            if order.get("type") == "delivery":
-                load_cargo_for_delivery(drone_id, order["id"])
-            
-            logger.info(f"Заказ {order['id']} назначен дрону {drone_id}")
-            return True
-        
-        return False
-        
-    except Exception as e:
-        logger.error(f"Ошибка назначения заказа дрону: {e}")
-        return False
 
 # Split a full route into two: up to first charger (station/base), then remainder to resume after charging
 def apply_midroute_charging(drone: Dict[str, Any], full_coords: List[Tuple[float, float]]):
