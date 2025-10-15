@@ -1,431 +1,1509 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
-	<meta charset="utf-8" />
-	<meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Планировщик дронов</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚁 Система управления дронами</title>
 	<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-		body { margin:0; font-family: Arial, sans-serif; }
-        #app { display:flex; height:100vh; }
-        #sidebar { width:380px; border-right:1px solid #ddd; padding:14px; box-sizing:border-box; overflow:auto; backdrop-filter: blur(4px); }
-        #map { flex:1; }
-        /* prevent layout jumping */
-        #orders, #drones { min-height: 120px; }
-		.order { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
-		label { display:block; margin-top:8px; font-size:12px; }
-		input, select { width:100%; padding:6px; box-sizing:border-box; }
-		button { margin-top:8px; padding:8px 10px; }
-        .row { display:flex; gap:8px; align-items:center; }
-        .row > * { flex:1; }
-        .drone { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
-        .muted { color:#666; font-size:12px; }
-        .toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; }
-        .section { margin-bottom:14px; }
-        .kpi { display:flex; gap:8px; }
-        .kpi > div { flex:1; background:#f7f7f7; padding:8px; border-radius:8px; text-align:center; }
-        .theme-dark .kpi > div { background:#222; }
-        .pill { display:inline-block; padding:2px 6px; border-radius:999px; font-size:12px; }
-        .pill.good { background:#E6F4EA; color:#1E8E3E; }
-        .pill.warn { background:#FEF7E0; color:#B06000; }
-        .pill.bad { background:#FCE8E6; color:#C5221F; }
-        .theme-dark body { background:#0f1115; color:#e0e6ed; }
-        .theme-dark #sidebar { background:#0f1115; border-right-color:#222; }
-        .theme-dark .order, .theme-dark .drone { border-color:#222; background:#12151c; }
-        .theme-dark input, .theme-dark select, .theme-dark textarea { background:#0c0f14; color:#e0e6ed; border:1px solid #1d2330; }
-        .theme-dark button { background:#1b2333; color:#e0e6ed; border:1px solid #2a3550; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            overflow: hidden;
+        }
+
+        #app {
+            display: flex;
+            height: 100vh;
+            position: relative;
+        }
+
+        /* Sidebar */
+        #sidebar {
+            width: 420px;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(20px);
+            border-right: 1px solid rgba(255, 255, 255, 0.2);
+            display: flex;
+            flex-direction: column;
+            box-shadow: 2px 0 20px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-align: center;
+        }
+
+        .sidebar-header h1 {
+            font-size: 24px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .sidebar-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+
+        /* Map */
+        #map {
+            flex: 1;
+            position: relative;
+        }
+
+        /* Cards */
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* Stats */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-item {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            opacity: 0.9;
+        }
+
+        /* Weather */
+        .weather-card {
+            background: linear-gradient(135deg, #74b9ff 0%, #0984e3 100%);
+            color: white;
+            margin-bottom: 20px;
+        }
+
+        .weather-info {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+
+        .weather-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+        }
+
+        /* Forms */
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            color: #555;
+            font-size: 14px;
+        }
+
+        .form-input, .form-select, .form-textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            background: white;
+        }
+
+        .form-input:focus, .form-select:focus, .form-textarea:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .form-row {
+            display: flex;
+            gap: 10px;
+            align-items: end;
+        }
+
+        .form-row .form-group {
+            flex: 1;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #00b894 0%, #00a085 100%);
+            color: white;
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #e17055 0%, #d63031 100%);
+            color: white;
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, #fdcb6e 0%, #e17055 100%);
+            color: white;
+        }
+
+        .btn-sm {
+            padding: 8px 12px;
+            font-size: 12px;
+        }
+
+        /* Lists */
+        .list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .list-item {
+            background: #f8f9fa;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            transition: all 0.3s ease;
+        }
+
+        .list-item:hover {
+            background: #e9ecef;
+            transform: translateX(5px);
+        }
+
+        .list-item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .list-item-title {
+            font-weight: 600;
+            color: #333;
+        }
+
+        .list-item-status {
+            padding: 4px 8px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-idle { background: #d1ecf1; color: #0c5460; }
+        .status-enroute { background: #d4edda; color: #155724; }
+        .status-charging { background: #fff3cd; color: #856404; }
+        .status-malfunction { background: #f8d7da; color: #721c24; }
+        .status-low-battery { background: #f8d7da; color: #721c24; }
+        .status-queued { background: #e2e3e5; color: #383d41; }
+        .status-assigned { background: #cce5ff; color: #004085; }
+
+        .list-item-details {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 8px;
+        }
+
+        .list-item-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        /* Drone shapes */
+        .drone-shape {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        .drone-circle { border-radius: 50%; }
+        .drone-square { border-radius: 2px; }
+        .drone-triangle { 
+            width: 0; 
+            height: 0; 
+            border-left: 10px solid transparent;
+            border-right: 10px solid transparent;
+            border-bottom: 20px solid;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 4px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 10px;
+            text-align: center;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: 500;
+        }
+
+        .tab.active {
+            background: white;
+            color: #667eea;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Progress bars */
+        .progress {
+            width: 100%;
+            height: 8px;
+            background: #e9ecef;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 5px 0;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #00b894, #00a085);
+            transition: width 0.3s ease;
+        }
+
+        .progress-bar.warning {
+            background: linear-gradient(90deg, #fdcb6e, #e17055);
+        }
+
+        .progress-bar.danger {
+            background: linear-gradient(90deg, #e17055, #d63031);
+        }
+
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+
+        .modal-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #999;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            #sidebar {
+                width: 100%;
+                position: absolute;
+                z-index: 1001;
+                transform: translateX(-100%);
+                transition: transform 0.3s ease;
+            }
+
+            #sidebar.open {
+                transform: translateX(0);
+            }
+
+            .sidebar-toggle {
+                position: absolute;
+                top: 20px;
+                left: 20px;
+                z-index: 1002;
+                background: white;
+                border: none;
+                border-radius: 50%;
+                width: 50px;
+                height: 50px;
+                box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+                cursor: pointer;
+            }
+        }
+
+        /* Animations */
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+
+        .pulse {
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .fade-in {
+            animation: fadeIn 0.5s ease;
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #a8a8a8;
+        }
 	</style>
 </head>
 <body>
 <div id="app">
+        <!-- Sidebar Toggle for Mobile -->
+        <button class="sidebar-toggle" onclick="toggleSidebar()">
+            <i class="fas fa-bars"></i>
+        </button>
+
+        <!-- Sidebar -->
 	<div id="sidebar">
-        <div class="toolbar">
-            <h3>Заказы</h3>
-            <label style="margin:0;display:flex;gap:6px;align-items:center;font-size:12px;">
-                <input type="checkbox" id="themeToggle"/>
-                Тёмная тема
-            </label>
+            <div class="sidebar-header">
+                <h1><i class="fas fa-drone"></i> Система управления дронами</h1>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-value" id="kpiDrones">0</div>
+                        <div class="stat-label">Дронов</div>
         </div>
-        <div class="kpi">
-            <div><div class="muted">Город</div><div id="kpiCity">—</div></div>
-            <div><div class="muted">Дронов</div><div id="kpiDrones">0</div></div>
-            <div><div class="muted">Заказов</div><div id="kpiOrders">0</div></div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="kpiOrders">0</div>
+                        <div class="stat-label">Заказов</div>
         </div>
-		<div id="orders"></div>
-		<hr />
-        <h4>Дроны</h4>
-        <div id="drones"></div>
-        <hr />
-        <div class="section">
-            <h4>База и инвентарь</h4>
-            <label>Координаты базы</label>
-            <div class="row">
-                <input id="base" placeholder="48.7080, 44.5133"/>
-                <button onclick="useClick('base')">На карте</button>
+                    <div class="stat-item">
+                        <div class="stat-value" id="kpiCity">—</div>
+                        <div class="stat-label">Город</div>
             </div>
-            <div class="row">
-                <input id="invCargo" type="number" min="0" value="2"/>
-                <input id="invOperator" type="number" min="0" value="1"/>
-                <input id="invCleaner" type="number" min="0" value="0"/>
             </div>
-            <div class="muted">cargo • operator • cleaner</div>
-            <button onclick="saveBase()">Сохранить базу</button>
         </div>
-        <hr />
-        <h4>Добавить заказ</h4>
-        <label>Откуда (широта, долгота или адрес)</label>
-        <input id="from" placeholder="48.7, 44.5 или адрес" />
-        <label>Куда (широта, долгота или адрес)</label>
-        <input id="to" placeholder="48.7, 44.6 или адрес" />
-        <div class="row">
-            <button onclick="useClick('from')">Выбрать Откуда</button>
-            <button onclick="useClick('to')">Выбрать Куда</button>
+
+            <div class="sidebar-content">
+                <!-- Weather Card -->
+                <div class="card weather-card">
+                    <div class="card-header">
+                        <div class="card-title">
+                            <i class="fas fa-cloud-sun"></i> Погода
         </div>
-        <label>Тип</label>
-		<select id="type">
-            <option value="delivery">доставка</option>
-            <option value="shooting">съёмка</option>
-            <option value="work">работа</option>
+                        <button class="btn btn-sm" onclick="refreshWeather()">
+                            <i class="fas fa-sync-alt"></i>
+                        </button>
+                    </div>
+                    <div class="weather-info" id="weatherInfo">
+                        <div class="weather-item">
+                            <i class="fas fa-thermometer-half"></i>
+                            <span id="weatherTemp">—°C</span>
+                        </div>
+                        <div class="weather-item">
+                            <i class="fas fa-tint"></i>
+                            <span id="weatherHumidity">—%</span>
+                        </div>
+                        <div class="weather-item">
+                            <i class="fas fa-wind"></i>
+                            <span id="weatherWind">— м/с</span>
+                        </div>
+                        <div class="weather-item">
+                            <i class="fas fa-eye"></i>
+                            <span id="weatherVisibility">— км</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tabs -->
+                <div class="tabs">
+                    <div class="tab active" onclick="switchTab('orders')">
+                        <i class="fas fa-list"></i> Заказы
+                    </div>
+                    <div class="tab" onclick="switchTab('drones')">
+                        <i class="fas fa-drone"></i> Дроны
+                    </div>
+                    <div class="tab" onclick="switchTab('settings')">
+                        <i class="fas fa-cog"></i> Настройки
+                    </div>
+                </div>
+
+                <!-- Orders Tab -->
+                <div id="ordersTab" class="tab-content">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <i class="fas fa-plus"></i> Новый заказ
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Откуда</label>
+                            <div class="form-row">
+                                <input type="text" id="from" class="form-input" placeholder="Адрес или координаты">
+                                <button class="btn btn-primary btn-sm" onclick="useClick('from')">
+                                    <i class="fas fa-map-marker-alt"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Куда</label>
+                            <div class="form-row">
+                                <input type="text" id="to" class="form-input" placeholder="Адрес или координаты">
+                                <button class="btn btn-primary btn-sm" onclick="useClick('to')">
+                                    <i class="fas fa-map-marker-alt"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Тип дрона</label>
+                            <select id="droneType" class="form-select">
+                                <option value="">Автоматический выбор</option>
 		</select>
-        <label>Батарея %</label>
-		<input id="battery" type="number" min="1" max="100" value="100" />
-        <label>Промежуточные точки (улицы/адреса, по одной в строке)</label>
-        <textarea id="waypoints" rows="3" placeholder="ул. Пример, 1\nул. Вторая, 5"></textarea>
-        <div class="row">
-            <input id="batchCount" type="number" min="1" max="10" value="1" />
-            <button onclick="submitOrder()">Отправить</button>
         </div>
-		<hr />
-        <h4>Бесполётные зоны</h4>
-        <p>Shift + зажатая левая кнопка — нарисовать прямоугольник</p>
-        <button onclick="clearZones()">Очистить зоны</button>
-		<hr />
-        <h4>Станции зарядки</h4>
-        <p>Alt + зажатая левая кнопка — добавить станцию. Ctrl + клик — удалить ближайшую.</p>
-        <div class="row">
-            <button onclick="pushStations()">Сохранить станции</button>
-            <button onclick="clearStations()">Очистить станции</button>
+                        <div class="form-group">
+                            <label class="form-label">Тип заказа</label>
+                            <select id="orderType" class="form-select">
+                                <option value="delivery">Доставка</option>
+                                <option value="shooting">Съёмка</option>
+                                <option value="work">Работа</option>
+                                <option value="inspection">Инспекция</option>
+                            </select>
         </div>
-        <label>Массовое добавление (по одной координате в строке: lat, lon)</label>
-        <textarea id="stationsBulk" rows="3" placeholder="48.700000, 44.500000\n48.710000, 44.520000"></textarea>
-        <button onclick="bulkAddStations()">Добавить станции из списка</button>
-        <h4>Город</h4>
-		<input id="city" value="Volgograd, Russia" />
-        <button onclick="loadCity()">Загрузить</button>
+                        <div class="form-group">
+                            <label class="form-label">Промежуточные точки</label>
+                            <textarea id="waypoints" class="form-textarea" rows="3" placeholder="Улица, дом (по одной в строке)"></textarea>
 	</div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Приоритет</label>
+                                <select id="priority" class="form-select">
+                                    <option value="5">Обычный (5)</option>
+                                    <option value="8">Высокий (8)</option>
+                                    <option value="10">Критический (10)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Количество</label>
+                                <input type="number" id="batchCount" class="form-input" min="1" max="10" value="1">
+                            </div>
+                        </div>
+                        <button class="btn btn-primary" onclick="submitOrder()">
+                            <i class="fas fa-paper-plane"></i> Создать заказ
+                        </button>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <i class="fas fa-list"></i> Активные заказы
+                            </div>
+                            <button class="btn btn-sm" onclick="refreshOrders()">
+                                <i class="fas fa-sync-alt"></i>
+                            </button>
+                        </div>
+                        <div class="list" id="ordersList">
+                            <!-- Orders will be populated here -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Drones Tab -->
+                <div id="dronesTab" class="tab-content" style="display: none;">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <i class="fas fa-drone"></i> Флот дронов
+                            </div>
+                            <button class="btn btn-sm" onclick="refreshDrones()">
+                                <i class="fas fa-sync-alt"></i>
+                            </button>
+                        </div>
+                        <div class="list" id="dronesList">
+                            <!-- Drones will be populated here -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Settings Tab -->
+                <div id="settingsTab" class="tab-content" style="display: none;">
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <i class="fas fa-map"></i> База и инвентарь
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Координаты базы</label>
+                            <div class="form-row">
+                                <input type="text" id="base" class="form-input" placeholder="48.7080, 44.5133">
+                                <button class="btn btn-primary btn-sm" onclick="useClick('base')">
+                                    <i class="fas fa-map-marker-alt"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Инвентарь дронов</label>
+                            <div class="form-row">
+                                <input type="number" id="invCargo" class="form-input" min="0" value="2" placeholder="Грузовые">
+                                <input type="number" id="invOperator" class="form-input" min="0" value="1" placeholder="Операторские">
+                                <input type="number" id="invCleaner" class="form-input" min="0" value="0" placeholder="Уборочные">
+                            </div>
+                        </div>
+                        <button class="btn btn-success" onclick="saveBase()">
+                            <i class="fas fa-save"></i> Сохранить базу
+                        </button>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <i class="fas fa-ban"></i> Бесполётные зоны
+                            </div>
+                        </div>
+                        <p style="margin-bottom: 15px; color: #666; font-size: 14px;">
+                            <i class="fas fa-info-circle"></i> 
+                            Shift + перетаскивание мыши для создания зоны
+                        </p>
+                        <button class="btn btn-danger" onclick="clearZones()">
+                            <i class="fas fa-trash"></i> Очистить все зоны
+                        </button>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <i class="fas fa-charging-station"></i> Станции зарядки
+                            </div>
+                        </div>
+                        <p style="margin-bottom: 15px; color: #666; font-size: 14px;">
+                            <i class="fas fa-info-circle"></i> 
+                            Alt + клик для добавления, Ctrl + правый клик для удаления
+                        </p>
+                        <div class="form-group">
+                            <label class="form-label">Массовое добавление</label>
+                            <textarea id="stationsBulk" class="form-textarea" rows="3" placeholder="48.700000, 44.500000&#10;48.710000, 44.520000"></textarea>
+                        </div>
+                        <div class="form-row">
+                            <button class="btn btn-success" onclick="bulkAddStations()">
+                                <i class="fas fa-plus"></i> Добавить
+                            </button>
+                            <button class="btn btn-danger" onclick="clearStations()">
+                                <i class="fas fa-trash"></i> Очистить
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="card-title">
+                                <i class="fas fa-city"></i> Город
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <input type="text" id="city" class="form-input" value="Volgograd, Russia">
+                        </div>
+                        <button class="btn btn-primary" onclick="loadCity()">
+                            <i class="fas fa-download"></i> Загрузить карту
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Map -->
 	<div id="map"></div>
 </div>
+
+    <!-- Modal for detailed drone info -->
+    <div id="droneModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">Детали дрона</div>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div id="droneModalContent">
+                <!-- Content will be populated here -->
+            </div>
+        </div>
+    </div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
+        // Global variables
 let map = L.map('map').setView([48.7080, 44.5133], 12);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
 let droneMarkers = {};
 let zoneLayers = [];
 let routeLayers = [];
 let historyLayers = {};
-let currentPick = null;
-let changeDestOrderId = null;
 let stationMarkers = [];
 let stations = [];
-let pushStationsTimer = null;
-function pushStationsDebounced(){
-    if (pushStationsTimer) clearTimeout(pushStationsTimer);
-    pushStationsTimer = setTimeout(()=>{ pushStations(); }, 300);
-}
-
+        let currentPick = null;
+        let changeDestOrderId = null;
 let ws;
-function connectWS(){
+        let currentTab = 'orders';
+
+        // Initialize map
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        // WebSocket connection
+        function connectWS() {
 	const proto = location.protocol === 'https:' ? 'wss' : 'ws';
 	ws = new WebSocket(`${proto}://${location.host}/ws`);
+            
 ws.onmessage = ev => {
-    const s = JSON.parse(ev.data);
-    updateOrders(s.orders||[]);
-    window.lastHistories = s.histories || {};
-    updateDrones(s.drones||{});
-    drawZones(s.no_fly_zones||[]);
-    // update stations from server truth
-    stations = s.stations || [];
+                const data = JSON.parse(ev.data);
+                updateOrders(data.orders || []);
+                updateDrones(data.drones || {});
+                updateWeather(data.weather || {});
+                drawZones(data.no_fly_zones || []);
+                stations = data.stations || [];
     drawStations();
-    // populate base input if empty and server sends base
-    if (s.base && (!document.getElementById('base').value || document.getElementById('base').value.trim()==='')){
-        const [lat, lon] = s.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
-    }
-    document.getElementById('kpiCity').textContent = s.city || '—';
-    document.getElementById('kpiDrones').textContent = Object.keys(s.drones||{}).length;
-    document.getElementById('kpiOrders').textContent = (s.orders||[]).length;
-};
-	ws.onclose = ()=> setTimeout(connectWS, 1000);
-}
-connectWS();
+                
+                // Update KPIs
+                document.getElementById('kpiDrones').textContent = Object.keys(data.drones || {}).length;
+                document.getElementById('kpiOrders').textContent = (data.orders || []).length;
+                document.getElementById('kpiCity').textContent = data.city || '—';
+                
+                // Update base if empty
+                if (data.base && !document.getElementById('base').value) {
+                    const [lat, lon] = data.base;
+                    document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+                }
+            };
+            
+            ws.onclose = () => setTimeout(connectWS, 1000);
+        }
 
-function updateOrders(orders){
-	const c = document.getElementById('orders');
-	const prevTop = c.scrollTop; const prevHeight = c.scrollHeight;
-	c.innerHTML = '';
-    orders.forEach((o, i)=>{
-		const d = document.createElement('div');
-		d.className = 'order';
-        d.innerHTML = `#${i+1} ${o.type} <b>${ruStatus(o.status)}</b><br>${fmt(o.start)} → ${fmt(o.end)}<br>`+
-            (o.id?`<span class="muted">${o.id}</span>`:'')+
-            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить точку</button></div>`:(o.status==='completed'?`<div class="muted">выполнен</div>`:''));
-		c.appendChild(d);
-	});
-	// keep scroll stable
-	c.scrollTop = Math.min(prevTop, c.scrollHeight - (prevHeight - prevTop));
-}
-function fmt(p){ return p ? `${p[0].toFixed(5)}, ${p[1].toFixed(5)}` : '-'; }
+        // Tab switching
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => content.style.display = 'none');
+            document.getElementById(tabName + 'Tab').style.display = 'block';
+            
+            currentTab = tabName;
+        }
 
-function updateDrones(drones){
-	// do not reset arrays drastically; remove previous polylines
-	Object.values(routeLayers).forEach(l=> map.removeLayer(l));
+        // Update weather display
+        function updateWeather(weather) {
+            if (!weather) return;
+            
+            document.getElementById('weatherTemp').textContent = `${weather.temperature || '—'}°C`;
+            document.getElementById('weatherHumidity').textContent = `${weather.humidity || '—'}%`;
+            document.getElementById('weatherWind').textContent = `${weather.wind_mps || '—'} м/с`;
+            document.getElementById('weatherVisibility').textContent = `${weather.visibility || '—'} км`;
+        }
+
+        // Update orders list
+        function updateOrders(orders) {
+            const container = document.getElementById('ordersList');
+            container.innerHTML = '';
+            
+            orders.forEach((order, index) => {
+                const orderDiv = document.createElement('div');
+                orderDiv.className = 'list-item fade-in';
+                
+                const statusClass = `status-${order.status}`;
+                const statusText = getStatusText(order.status);
+                
+                orderDiv.innerHTML = `
+                    <div class="list-item-header">
+                        <div class="list-item-title">#${index + 1} ${getOrderTypeText(order.type)}</div>
+                        <div class="list-item-status ${statusClass}">${statusText}</div>
+                    </div>
+                    <div class="list-item-details">
+                        <div><i class="fas fa-map-marker-alt"></i> ${formatCoords(order.start)} → ${formatCoords(order.end)}</div>
+                        ${order.priority ? `<div><i class="fas fa-flag"></i> Приоритет: ${order.priority}</div>` : ''}
+                        ${order.drone_id ? `<div><i class="fas fa-drone"></i> Дрон: ${order.drone_id}</div>` : ''}
+                    </div>
+                    <div class="list-item-actions">
+                        ${order.status === 'queued' || order.status === 'assigned' ? 
+                            `<button class="btn btn-danger btn-sm" onclick="cancelOrder('${order.id}')">
+                                <i class="fas fa-times"></i> Отменить
+                            </button>
+                            <button class="btn btn-warning btn-sm" onclick="pickNewDestination('${order.id}')">
+                                <i class="fas fa-edit"></i> Изменить
+                            </button>` : 
+                            order.status === 'completed' ? 
+                            `<div style="color: #28a745; font-size: 12px;"><i class="fas fa-check"></i> Выполнен</div>` :
+                            ''
+                        }
+                    </div>
+                `;
+                
+                container.appendChild(orderDiv);
+            });
+        }
+
+        // Update drones list
+        function updateDrones(drones) {
+            // Clear previous routes
+            Object.values(routeLayers).forEach(layer => map.removeLayer(layer));
 	routeLayers = [];
-    Object.values(historyLayers).forEach(l=> map.removeLayer(l));
+            Object.values(historyLayers).forEach(layer => map.removeLayer(layer));
     historyLayers = {};
-	const list = document.getElementById('drones');
-	const prevTop = list.scrollTop; const prevHeight = list.scrollHeight;
-	list.innerHTML='';
-    const palette = ['#4285F4','#EA4335','#FBBC05','#34A853','#9C27B0','#FF9800','#795548','#607D8B'];
-    const ids = Object.keys(drones);
-    for (let idx=0; idx<ids.length; idx++){
-        const id = ids[idx];
-        const d = drones[id];
-        const color = palette[idx % palette.length];
-        const icon = L.divIcon({className:'drone-icon', html:`<div style="width:18px;height:18px;background:${color};border-radius:50%;border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,.4)"></div>`});
-        if (!droneMarkers[id]){
-            droneMarkers[id] = L.marker(d.pos,{icon}).addTo(map).bindPopup(id);
-        }else{
-            droneMarkers[id].setLatLng(d.pos);
-            droneMarkers[id].setIcon(icon);
+            
+            const container = document.getElementById('dronesList');
+            container.innerHTML = '';
+            
+            const droneTypes = ['cargo', 'operator', 'cleaner'];
+            const colors = ['#e74c3c', '#3498db', '#2ecc71'];
+            const shapes = ['circle', 'square', 'triangle'];
+            
+            Object.entries(drones).forEach(([id, drone], index) => {
+                const droneDiv = document.createElement('div');
+                droneDiv.className = 'list-item fade-in';
+                
+                const typeIndex = droneTypes.indexOf(drone.type) || 0;
+                const color = colors[typeIndex] || '#95a5a6';
+                const shape = shapes[typeIndex] || 'circle';
+                
+                const batteryPercent = drone.battery || 0;
+                const batteryClass = batteryPercent > 50 ? '' : batteryPercent > 20 ? 'warning' : 'danger';
+                
+                droneDiv.innerHTML = `
+                    <div class="list-item-header">
+                        <div class="list-item-title">
+                            <span class="drone-shape drone-${shape}" style="background: ${color}"></span>
+                            ${id} (${getDroneTypeText(drone.type)})
+                        </div>
+                        <div class="list-item-status status-${drone.status}">${getStatusText(drone.status)}</div>
+                    </div>
+                    <div class="list-item-details">
+                        <div><i class="fas fa-battery-half"></i> Батарея: ${batteryPercent.toFixed(0)}%</div>
+                        <div><i class="fas fa-clock"></i> ETA: ${drone.eta_s ? Math.round(drone.eta_s / 60) + ' мин' : '—'}</div>
+                        ${drone.has_cargo ? '<div><i class="fas fa-box"></i> С грузом</div>' : ''}
+                        ${drone.health ? `<div><i class="fas fa-heart"></i> Здоровье: ${(drone.health * 100).toFixed(0)}%</div>` : ''}
+                    </div>
+                    <div class="progress">
+                        <div class="progress-bar ${batteryClass}" style="width: ${batteryPercent}%"></div>
+                    </div>
+                    <div class="list-item-actions">
+                        <button class="btn btn-primary btn-sm" onclick="focusDrone('${id}')">
+                            <i class="fas fa-search"></i> Найти
+                        </button>
+                        <button class="btn btn-warning btn-sm" onclick="showDroneDetails('${id}')">
+                            <i class="fas fa-info"></i> Детали
+                        </button>
+                        ${drone.status === 'malfunction' ? 
+                            `<button class="btn btn-success btn-sm" onclick="repairDrone('${id}')">
+                                <i class="fas fa-wrench"></i> Ремонт
+                            </button>` : ''
+                        }
+                    </div>
+                `;
+                
+                container.appendChild(droneDiv);
+                
+                // Update map markers
+                updateDroneMarker(id, drone, color, shape);
+            });
         }
-        if (d.route && d.route.length){
-            const poly = L.polyline(d.route, {color}).addTo(map);
-			routeLayers.push(poly);
-		}
-        if (window.lastHistories && window.lastHistories[id] && window.lastHistories[id].length >= 2){
-            const hpoly = L.polyline(window.lastHistories[id], {color, weight:2, opacity:0.6, dashArray:'4 4'}).addTo(map);
-            historyLayers[id] = hpoly;
+
+        // Update drone marker on map
+        function updateDroneMarker(id, drone, color, shape) {
+            const icon = createDroneIcon(color, shape);
+            
+            if (!droneMarkers[id]) {
+                droneMarkers[id] = L.marker(drone.pos, { icon }).addTo(map);
+                droneMarkers[id].bindPopup(`
+                    <div style="text-align: center;">
+                        <h4>${id}</h4>
+                        <p><strong>Тип:</strong> ${getDroneTypeText(drone.type)}</p>
+                        <p><strong>Статус:</strong> ${getStatusText(drone.status)}</p>
+                        <p><strong>Батарея:</strong> ${(drone.battery || 0).toFixed(0)}%</p>
+                    </div>
+                `);
+            } else {
+                droneMarkers[id].setLatLng(drone.pos);
+                droneMarkers[id].setIcon(icon);
+            }
+            
+            // Draw route
+            if (drone.route && drone.route.length > 0) {
+                const polyline = L.polyline(drone.route, { color, weight: 3, opacity: 0.7 }).addTo(map);
+                routeLayers.push(polyline);
+            }
+            
+            // Draw history
+            if (window.lastHistories && window.lastHistories[id] && window.lastHistories[id].length >= 2) {
+                const historyPolyline = L.polyline(window.lastHistories[id], {
+                    color,
+                    weight: 2,
+                    opacity: 0.4,
+                    dashArray: '5, 5'
+                }).addTo(map);
+                historyLayers[id] = historyPolyline;
+            }
         }
-        const item = document.createElement('div');
-        item.className='drone';
-        const eta = d.eta_s!=null?`${Math.round(d.eta_s/60)} мин`:'-';
-        const bat = d.battery!=null?`${d.battery.toFixed(0)}%`:'-';
-        const lq = d.link_quality!=null?qualityPill(d.link_quality):'';
-        const toStreet = (d.route && d.target_idx!=null && d.route[d.target_idx]) ? d.route[d.target_idx] : null;
-        item.innerHTML = `<b>${id}</b> • ${ruStatus(d.status)||'-'} ${lq}<br>`+
-            `Заряд: ${bat} • Осталось: ${eta}` + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
-        item.onclick = ()=> focusDrone(id);
-		list.appendChild(item);
-        if (toStreet){ fetchStreet(toStreet, id); }
-	}
-	// keep scroll stable
-	list.scrollTop = Math.min(prevTop, list.scrollHeight - (prevHeight - prevTop));
-}
 
-function drawZones(zones){
-	zoneLayers.forEach(l=> map.removeLayer(l));
-	zoneLayers = [];
-	zones.forEach(z=>{
-		const b = [[Math.min(z.lat_min, z.lat_max), Math.min(z.lon_min, z.lon_max)], [Math.max(z.lat_min, z.lat_max), Math.max(z.lon_min, z.lon_max)]];
-		const r = L.rectangle(b, {color:'#EA4335', weight:1, fillOpacity:0.2}).addTo(map);
-		zoneLayers.push(r);
-	});
-}
-
-function drawStations(){
-    stationMarkers.forEach(m=> map.removeLayer(m));
-    stationMarkers = [];
-    stations.forEach(s=>{
-        const m = L.circleMarker(s, {radius:6, color:'#34A853', weight:2, fillColor:'#34A853', fillOpacity:0.6}).addTo(map).bindTooltip('Станция зарядки');
-        stationMarkers.push(m);
-    });
-}
-
-async function loadCity(){
-	const city = document.getElementById('city').value;
-	await fetch('/api/load_city', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({city})});
-}
-
-function parseMaybeCoords(s){
-	if (!s) return null;
-	if (s.includes(',')){
-		try{ const [a,b] = s.split(',').map(x=>parseFloat(x.trim())); if (!isNaN(a)&&!isNaN(b)) return [a,b]; }catch(e){}
-	}
-	return null;
-}
-
-async function submitOrder(){
-    const f = document.getElementById('from').value.trim();
-    const t = document.getElementById('to').value.trim();
-    const type = document.getElementById('type').value;
-    const battery = parseFloat(document.getElementById('battery').value||'100');
-    const batch = Math.max(1, Math.min(10, parseInt(document.getElementById('batchCount').value||'1')));
-    const waypointsText = (document.getElementById('waypoints').value||'').trim();
-    const wpCoords = [];
-    if (waypointsText){
-        for (const line of waypointsText.split(/\n+/)){
-            const s = line.trim(); if (!s) continue;
-            const pc = parseMaybeCoords(s);
-            if (pc) wpCoords.push(pc);
+        // Create drone icon based on type
+        function createDroneIcon(color, shape) {
+            let html;
+            switch (shape) {
+                case 'circle':
+                    html = `<div style="width: 20px; height: 20px; background: ${color}; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.3);"></div>`;
+                    break;
+                case 'square':
+                    html = `<div style="width: 20px; height: 20px; background: ${color}; border-radius: 3px; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.3);"></div>`;
+                    break;
+                case 'triangle':
+                    html = `<div style="width: 0; height: 0; border-left: 10px solid transparent; border-right: 10px solid transparent; border-bottom: 20px solid ${color}; filter: drop-shadow(0 0 5px rgba(0,0,0,0.3));"></div>`;
+                    break;
+                default:
+                    html = `<div style="width: 20px; height: 20px; background: ${color}; border-radius: 50%; border: 3px solid white; box-shadow: 0 0 10px rgba(0,0,0,0.3);"></div>`;
+            }
+            
+            return L.divIcon({
+                className: 'drone-icon',
+                html: html,
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+            });
         }
-    }
-    for (let i=0;i<batch;i++){
-        const body = { type_hint: type, battery_level: battery };
-        const fc = parseMaybeCoords(f); const tc = parseMaybeCoords(t);
-        if (fc) body.coords_from = fc; else body.address_from = f;
-        if (tc) body.coords_to = tc; else body.address_to = t;
-        if (wpCoords.length) body.waypoints = wpCoords;
-        await fetch('/api/orders', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-    }
-}
 
-function useClick(which){
-    currentPick = which;
-}
+        // Draw no-fly zones
+        function drawZones(zones) {
+            zoneLayers.forEach(layer => map.removeLayer(layer));
+            zoneLayers = [];
+            
+            zones.forEach(zone => {
+                const bounds = [
+                    [Math.min(zone.lat_min, zone.lat_max), Math.min(zone.lon_min, zone.lon_max)],
+                    [Math.max(zone.lat_min, zone.lat_max), Math.max(zone.lon_min, zone.lon_max)]
+                ];
+                
+                const rectangle = L.rectangle(bounds, {
+                    color: '#e74c3c',
+                    weight: 2,
+                    fillOpacity: 0.2,
+                    fillColor: '#e74c3c'
+                }).addTo(map);
+                
+                rectangle.bindTooltip('Бесполётная зона', { permanent: false });
+                zoneLayers.push(rectangle);
+            });
+        }
 
-map.on('click', (e)=>{
-    const {lat, lng} = e.latlng;
-    if (currentPick){
-        const s = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
-        if (currentPick==='base') document.getElementById('base').value = s; else document.getElementById(currentPick).value = s;
+        // Draw charging stations
+        function drawStations() {
+            stationMarkers.forEach(marker => map.removeLayer(marker));
+            stationMarkers = [];
+            
+            stations.forEach(station => {
+                const marker = L.circleMarker(station, {
+                    radius: 8,
+                    color: '#27ae60',
+                    weight: 3,
+                    fillColor: '#2ecc71',
+                    fillOpacity: 0.7
+                }).addTo(map);
+                
+                marker.bindTooltip('Станция зарядки', { permanent: false });
+                stationMarkers.push(marker);
+            });
+        }
+
+        // Map event handlers
+        map.on('click', (e) => {
+            const { lat, lng } = e.latlng;
+            
+            if (currentPick) {
+                const coords = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+                document.getElementById(currentPick).value = coords;
         currentPick = null;
         return;
     }
-    if (changeDestOrderId){
+            
+            if (changeDestOrderId) {
         updateOrderDestination(changeDestOrderId, [lat, lng]);
         changeDestOrderId = null;
         return;
     }
+            
     // Add station with Alt+Click
-    if (e.originalEvent.altKey){
+            if (e.originalEvent.altKey) {
         stations.push([lat, lng]);
         drawStations();
-        pushStationsDebounced();
+                pushStations();
         return;
     }
 });
 
-// rectangle drawing with Shift+Drag
-let drawing = false; let startLatLng = null; let tempRect = null;
-map.on('mousedown', (e)=>{ if (!e.originalEvent.shiftKey) return; drawing = true; startLatLng = e.latlng; tempRect && map.removeLayer(tempRect); });
-map.on('mousemove', (e)=>{ if (!drawing) return; const bounds = L.latLngBounds(startLatLng, e.latlng); tempRect && map.removeLayer(tempRect); tempRect = L.rectangle(bounds, {color:'#EA4335', weight:1, dashArray:'4', fillOpacity:0.1}).addTo(map); });
-map.on('mouseup', async (e)=>{
-	if (!drawing) return; drawing = false;
+        // Rectangle drawing for no-fly zones
+        let drawing = false;
+        let startLatLng = null;
+        let tempRect = null;
+
+        map.on('mousedown', (e) => {
+            if (!e.originalEvent.shiftKey) return;
+            drawing = true;
+            startLatLng = e.latlng;
+            if (tempRect) map.removeLayer(tempRect);
+        });
+
+        map.on('mousemove', (e) => {
+            if (!drawing) return;
 	const bounds = L.latLngBounds(startLatLng, e.latlng);
-	const sw = bounds.getSouthWest(); const ne = bounds.getNorthEast();
-	await fetch('/api/no_fly_zones', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({lat_min: sw.lat, lon_min: sw.lng, lat_max: ne.lat, lon_max: ne.lng})});
-	if (tempRect) { map.removeLayer(tempRect); tempRect = null; }
-});
+            if (tempRect) map.removeLayer(tempRect);
+            tempRect = L.rectangle(bounds, {
+                color: '#e74c3c',
+                weight: 2,
+                dashArray: '5, 5',
+                fillOpacity: 0.1
+            }).addTo(map);
+        });
 
-async function clearZones(){
-	const res = await (await fetch('/api/no_fly_zones')).json();
-	for (const z of res){ await fetch(`/api/no_fly_zones/${z.id}`, {method:'DELETE'}); }
-}
+        map.on('mouseup', async (e) => {
+            if (!drawing) return;
+            drawing = false;
+            
+            const bounds = L.latLngBounds(startLatLng, e.latlng);
+            const sw = bounds.getSouthWest();
+            const ne = bounds.getNorthEast();
+            
+            await fetch('/api/no_fly_zones', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    lat_min: sw.lat,
+                    lon_min: sw.lng,
+                    lat_max: ne.lat,
+                    lon_max: ne.lng
+                })
+            });
+            
+            if (tempRect) {
+                map.removeLayer(tempRect);
+                tempRect = null;
+            }
+        });
 
-function nearestStationIndex(lat, lng){
-    let bi = -1; let bd = 1e18;
-    for (let i=0;i<stations.length;i++){
-        const s = stations[i];
-        const d = Math.hypot(s[0]-lat, s[1]-lng);
-        if (d < bd){ bd = d; bi = i; }
-    }
-    return bi;
-}
+        // Right-click to remove nearest station
+        map.on('contextmenu', (e) => {
+            if (!e.originalEvent.ctrlKey) return;
+            
+            const { lat, lng } = e.latlng;
+            const nearestIndex = findNearestStationIndex(lat, lng);
+            
+            if (nearestIndex >= 0) {
+                stations.splice(nearestIndex, 1);
+                drawStations();
+                pushStations();
+            }
+        });
 
-map.on('contextmenu', (e)=>{
-    // Ctrl + right-click to remove nearest station
-    if (!e.originalEvent.ctrlKey) return;
-    const {lat, lng} = e.latlng;
-    const idx = nearestStationIndex(lat, lng);
-    if (idx >= 0){ stations.splice(idx, 1); drawStations(); pushStationsDebounced(); }
-});
+        // Utility functions
+        function parseCoords(str) {
+            if (!str) return null;
+            if (str.includes(',')) {
+                try {
+                    const [lat, lon] = str.split(',').map(x => parseFloat(x.trim()));
+                    if (!isNaN(lat) && !isNaN(lon)) return [lat, lon];
+                } catch (e) {}
+            }
+            return null;
+        }
 
-async function pushStations(){
-    await fetch('/api/stations', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({stations})});
-}
+        function formatCoords(coords) {
+            return coords ? `${coords[0].toFixed(5)}, ${coords[1].toFixed(5)}` : '—';
+        }
 
-function clearStations(){ stations = []; drawStations(); }
+        function getStatusText(status) {
+            const statusMap = {
+                'idle': 'Свободен',
+                'enroute': 'В пути',
+                'charging': 'Зарядка',
+                'malfunction': 'Поломка',
+                'low_battery': 'Низкий заряд',
+                'queued': 'В очереди',
+                'assigned': 'Назначен',
+                'completed': 'Завершён',
+                'cancelled': 'Отменён',
+                'emergency_charging': 'Экстренная зарядка',
+                'returning_to_base': 'Возвращается на базу'
+            };
+            return statusMap[status] || status;
+        }
 
-function bulkAddStations(){
-    const t = (document.getElementById('stationsBulk').value||'').trim();
-    if (!t) return;
-    for (const line of t.split(/\n+/)){
-        const s = line.trim(); if (!s) continue;
-        const pc = parseMaybeCoords(s); if (pc) stations.push(pc);
-    }
-    drawStations();
-    pushStationsDebounced();
-}
+        function getOrderTypeText(type) {
+            const typeMap = {
+                'delivery': 'Доставка',
+                'shooting': 'Съёмка',
+                'work': 'Работа',
+                'inspection': 'Инспекция'
+            };
+            return typeMap[type] || type;
+        }
 
-async function cancelOrder(id){
-    if (!id) return;
-    await fetch(`/api/orders/${id}/cancel`, {method:'POST'});
-}
+        function getDroneTypeText(type) {
+            const typeMap = {
+                'cargo': 'Грузовой',
+                'operator': 'Операторский',
+                'cleaner': 'Уборочный'
+            };
+            return typeMap[type] || type;
+        }
 
-function pickNewDestination(orderId){
+        function findNearestStationIndex(lat, lng) {
+            let bestIndex = -1;
+            let bestDistance = Infinity;
+            
+            stations.forEach((station, index) => {
+                const distance = Math.hypot(station[0] - lat, station[1] - lng);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = index;
+                }
+            });
+            
+            return bestIndex;
+        }
+
+        // API functions
+        async function submitOrder() {
+            const from = document.getElementById('from').value.trim();
+            const to = document.getElementById('to').value.trim();
+            const orderType = document.getElementById('orderType').value;
+            const droneType = document.getElementById('droneType').value;
+            const priority = parseInt(document.getElementById('priority').value);
+            const batchCount = parseInt(document.getElementById('batchCount').value);
+            const waypointsText = document.getElementById('waypoints').value.trim();
+            
+            const waypoints = [];
+            if (waypointsText) {
+                waypointsText.split('\n').forEach(line => {
+                    const coords = parseCoords(line.trim());
+                    if (coords) waypoints.push(coords);
+                });
+            }
+            
+            for (let i = 0; i < batchCount; i++) {
+                const body = {
+                    type_hint: orderType,
+                    priority: priority
+                };
+                
+                if (droneType) body.drone_type = droneType;
+                
+                const fromCoords = parseCoords(from);
+                const toCoords = parseCoords(to);
+                
+                if (fromCoords) body.coords_from = fromCoords;
+                else body.address_from = from;
+                
+                if (toCoords) body.coords_to = toCoords;
+                else body.address_to = to;
+                
+                if (waypoints.length > 0) body.waypoints = waypoints;
+                
+                try {
+                    await fetch('/api/orders', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    });
+                } catch (error) {
+                    console.error('Error creating order:', error);
+                }
+            }
+            
+            // Clear form
+            document.getElementById('from').value = '';
+            document.getElementById('to').value = '';
+            document.getElementById('waypoints').value = '';
+        }
+
+        async function cancelOrder(orderId) {
+            try {
+                await fetch(`/api/orders/${orderId}/cancel`, { method: 'POST' });
+            } catch (error) {
+                console.error('Error cancelling order:', error);
+            }
+        }
+
+        function pickNewDestination(orderId) {
     changeDestOrderId = orderId;
 }
 
-async function updateOrderDestination(orderId, coords){
+        async function updateOrderDestination(orderId, coords) {
+            try {
     await fetch(`/api/orders/${orderId}/update_destination`, {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ new_coords_to: coords })
     });
-}
+            } catch (error) {
+                console.error('Error updating destination:', error);
+            }
+        }
 
-// Theme toggle
-const themeToggle = document.getElementById('themeToggle');
-themeToggle.addEventListener('change', ()=>{
-    document.documentElement.classList.toggle('theme-dark', themeToggle.checked);
-});
+        function useClick(field) {
+            currentPick = field;
+        }
 
-function ruStatus(s){
-    return ({
-        'idle':'свободен', 'enroute':'в пути', 'avoidance':'обход препятствия', 'holding':'ожидание', 'low_battery':'низкий заряд', 'assigned':'назначен', 'queued':'в очереди', 'cancelled':'отменён'
-    })[s]||s;
-}
+        function focusDrone(droneId) {
+            const marker = droneMarkers[droneId];
+            if (marker) {
+                map.setView(marker.getLatLng(), 15);
+                marker.openPopup();
+            }
+        }
 
-function focusDrone(id){
-    const m = droneMarkers[id];
-    if (m){ map.setView(m.getLatLng(), 15); m.openPopup(); }
-}
+        async function showDroneDetails(droneId) {
+            try {
+                const response = await fetch(`/api/drones/${droneId}/status`);
+                const drone = await response.json();
+                
+                const modalContent = document.getElementById('droneModalContent');
+                modalContent.innerHTML = `
+                    <div style="text-align: center; margin-bottom: 20px;">
+                        <h3>${droneId}</h3>
+                        <p><strong>Тип:</strong> ${getDroneTypeText(drone.type)}</p>
+                        <p><strong>Статус:</strong> ${getStatusText(drone.status)}</p>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px;">
+                        <div>
+                            <h4>Параметры</h4>
+                            <p><strong>Батарея:</strong> ${(drone.battery || 0).toFixed(1)}%</p>
+                            <p><strong>Здоровье:</strong> ${(drone.health || 0) * 100}%</p>
+                            <p><strong>Скорость:</strong> ${drone.speed || 0} м/с</p>
+                            <p><strong>Высота:</strong> ${drone.altitude || 0} м</p>
+                        </div>
+                        <div>
+                            <h4>Телеметрия</h4>
+                            <p><strong>Температура:</strong> ${drone.temperature || 0}°C</p>
+                            <p><strong>Качество связи:</strong> ${(drone.link_quality || 0) * 100}%</p>
+                            <p><strong>Часы работы:</strong> ${drone.operating_hours || 0}ч</p>
+                            <p><strong>Последнее ТО:</strong> ${drone.last_maintenance || '—'}</p>
+                        </div>
+                    </div>
+                    <div style="text-align: center;">
+                        <button class="btn btn-primary" onclick="focusDrone('${droneId}'); closeModal();">
+                            <i class="fas fa-search"></i> Найти на карте
+                        </button>
+                    </div>
+                `;
+                
+                document.getElementById('droneModal').style.display = 'flex';
+            } catch (error) {
+                console.error('Error fetching drone details:', error);
+            }
+        }
 
-async function fetchStreet(latlng, droneId){
-    try{
-        const [lat, lon] = latlng;
-        const r = await fetch('/api/reverse', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({lat, lon})});
-        const j = await r.json();
-        const el = document.getElementById(`street_${droneId}`);
-        if (el){ el.textContent = j.address || '—'; }
-    }catch(e){}
-}
+        async function repairDrone(droneId) {
+            try {
+                await fetch(`/api/drones/${droneId}/repair`, { method: 'POST' });
+            } catch (error) {
+                console.error('Error repairing drone:', error);
+            }
+        }
 
-function qualityPill(q){
-    let cls = q>=0.75? 'good' : (q>=0.4? 'warn' : 'bad');
-    const pct = Math.round(q*100);
-    return `<span class="pill ${cls}">связь ${pct}%</span>`;
-}
+        async function clearZones() {
+            if (!confirm('Удалить все бесполётные зоны?')) return;
+            
+            try {
+                await fetch('/api/no_fly_zones/clear', { method: 'POST' });
+            } catch (error) {
+                console.error('Error clearing zones:', error);
+            }
+        }
 
-async function saveBase(){
-    const b = document.getElementById('base').value.trim();
-    const bc = parseMaybeCoords(b);
-    const inv = {
-        cargo: parseInt(document.getElementById('invCargo').value||'0'),
-        operator: parseInt(document.getElementById('invOperator').value||'0'),
-        cleaner: parseInt(document.getElementById('invCleaner').value||'0'),
-    };
-    await fetch('/api/base', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({base: bc, inventory: inv})});
-}
+        async function clearStations() {
+            if (!confirm('Удалить все станции зарядки?')) return;
+            
+            stations = [];
+            drawStations();
+            await pushStations();
+        }
 
-// Автозагрузка города при старте (для удобства)
-window.addEventListener('load', ()=>{ loadCity(); });
-// Load base and stations on startup to populate UI quickly
-window.addEventListener('load', async ()=>{
-    try{
-        const r = await fetch('/api/base'); const j = await r.json();
-        if (j.base){ const [lat, lon] = j.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`; }
-        if (Array.isArray(j.stations)){ stations = j.stations; drawStations(); }
-    }catch(e){}
+        async function bulkAddStations() {
+            const text = document.getElementById('stationsBulk').value.trim();
+            if (!text) return;
+            
+            text.split('\n').forEach(line => {
+                const coords = parseCoords(line.trim());
+                if (coords) stations.push(coords);
+            });
+            
+            drawStations();
+            await pushStations();
+        }
+
+        async function pushStations() {
+            try {
+                await fetch('/api/stations', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ stations })
+                });
+            } catch (error) {
+                console.error('Error saving stations:', error);
+            }
+        }
+
+        async function saveBase() {
+            const base = document.getElementById('base').value.trim();
+            const baseCoords = parseCoords(base);
+            const inventory = {
+                cargo: parseInt(document.getElementById('invCargo').value || '0'),
+                operator: parseInt(document.getElementById('invOperator').value || '0'),
+                cleaner: parseInt(document.getElementById('invCleaner').value || '0')
+            };
+            
+            try {
+                await fetch('/api/base', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ base: baseCoords, inventory })
+                });
+            } catch (error) {
+                console.error('Error saving base:', error);
+            }
+        }
+
+        async function loadCity() {
+            const city = document.getElementById('city').value;
+            try {
+                await fetch('/api/load_city', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ city })
+                });
+                // Обновляем погоду для нового города
+                await refreshWeather();
+            } catch (error) {
+                console.error('Error loading city:', error);
+            }
+        }
+
+        async function refreshWeather() {
+            try {
+                // Сначала обновляем погоду для текущего города
+                const updateResponse = await fetch('/api/weather/update', { method: 'POST' });
+                if (updateResponse.ok) {
+                    const updateData = await updateResponse.json();
+                    if (updateData.weather) {
+                        updateWeather(updateData.weather);
+                        return;
+                    }
+                }
+                
+                // Если обновление не удалось, получаем текущую погоду
+                const response = await fetch('/api/weather');
+                const data = await response.json();
+                if (data.weather) {
+                    updateWeather(data.weather);
+                }
+            } catch (error) {
+                console.error('Error updating weather:', error);
+            }
+        }
+
+        function refreshOrders() {
+            // Orders will be refreshed via WebSocket
+        }
+
+        function refreshDrones() {
+            // Drones will be refreshed via WebSocket
+        }
+
+        function closeModal() {
+            document.getElementById('droneModal').style.display = 'none';
+        }
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+
+        // Load drone types
+        async function loadDroneTypes() {
+            try {
+                const response = await fetch('/api/drone_types');
+                const types = await response.json();
+                
+                const select = document.getElementById('droneType');
+                select.innerHTML = '<option value="">Автоматический выбор</option>';
+                
+                types.forEach(type => {
+                    const option = document.createElement('option');
+                    option.value = type.type;
+                    option.textContent = `${type.display_name} (${type.available} доступно)`;
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                console.error('Error loading drone types:', error);
+            }
+        }
+
+        // Initialize
+        connectWS();
+        loadDroneTypes();
+        
+        // Load weather on startup
+        window.addEventListener('load', async () => {
+            try {
+                const response = await fetch('/api/weather');
+                const data = await response.json();
+                if (data.weather) {
+                    updateWeather(data.weather);
+                }
+            } catch (error) {
+                console.error('Error loading weather:', error);
+            }
+        });
+        
+        // Auto-update weather every minute
+        setInterval(async () => {
+            try {
+                await refreshWeather();
+            } catch (error) {
+                console.error('Error auto-updating weather:', error);
+            }
+        }, 60000); // 60 seconds
+        
+        // Load base and stations on startup
+        window.addEventListener('load', async () => {
+            try {
+                const response = await fetch('/api/base');
+                const data = await response.json();
+                
+                if (data.base) {
+                    const [lat, lon] = data.base;
+                    document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+                }
+                
+                if (Array.isArray(data.stations)) {
+                    stations = data.stations;
+                    drawStations();
+                }
+            } catch (error) {
+                console.error('Error loading initial data:', error);
+            }
+        });
+
+        // Close modal when clicking outside
+        document.getElementById('droneModal').addEventListener('click', (e) => {
+            if (e.target.id === 'droneModal') {
+                closeModal();
+            }
 });
 </script>
 </body>
