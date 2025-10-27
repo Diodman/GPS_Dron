@@ -3,115 +3,512 @@
 <head>
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Планировщик дронов</title>
+    <title>🚁 Планировщик дронов</title>
 	<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <style>
-		body { margin:0; font-family: Arial, sans-serif; }
-        #app { display:flex; height:100vh; }
-        #sidebar { width:380px; border-right:1px solid #ddd; padding:14px; box-sizing:border-box; overflow:auto; backdrop-filter: blur(4px); }
-        #map { flex:1; }
-        /* prevent layout jumping */
-        #orders, #drones { min-height: 120px; }
-		.order { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
-		label { display:block; margin-top:8px; font-size:12px; }
-		input, select { width:100%; padding:6px; box-sizing:border-box; }
-		button { margin-top:8px; padding:8px 10px; }
-        .row { display:flex; gap:8px; align-items:center; }
-        .row > * { flex:1; }
-        .drone { padding:6px; border:1px solid #eee; margin-bottom:6px; border-radius:6px; }
-        .muted { color:#666; font-size:12px; }
-        .toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; }
-        .section { margin-bottom:14px; }
-        .kpi { display:flex; gap:8px; }
-        .kpi > div { flex:1; background:#f7f7f7; padding:8px; border-radius:8px; text-align:center; }
-        .theme-dark .kpi > div { background:#222; }
-        .pill { display:inline-block; padding:2px 6px; border-radius:999px; font-size:12px; }
-        .pill.good { background:#E6F4EA; color:#1E8E3E; }
-        .pill.warn { background:#FEF7E0; color:#B06000; }
-        .pill.bad { background:#FCE8E6; color:#C5221F; }
-        .theme-dark body { background:#0f1115; color:#e0e6ed; }
-        .theme-dark #sidebar { background:#0f1115; border-right-color:#222; }
-        .theme-dark .order, .theme-dark .drone { border-color:#222; background:#12151c; }
-        .theme-dark input, .theme-dark select, .theme-dark textarea { background:#0c0f14; color:#e0e6ed; border:1px solid #1d2330; }
-        .theme-dark button { background:#1b2333; color:#e0e6ed; border:1px solid #2a3550; }
+		:root {
+			--bg-light: #f8fafc;
+			--bg-dark: #0f172a;
+			--sidebar-light: #ffffff;
+			--sidebar-dark: #1e293b;
+			--border-light: #e2e8f0;
+			--border-dark: #334155;
+			--text-light: #1e293b;
+			--text-dark: #e2e8f0;
+			--primary: #3b82f6;
+			--primary-hover: #2563eb;
+			--success: #10b981;
+			--warning: #f59e0b;
+			--danger: #ef4444;
+			--accent: #8b5cf6;
+		}
+
+		* {
+			margin: 0;
+			padding: 0;
+			box-sizing: border-box;
+		}
+
+		body {
+			font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+			background: var(--bg-light);
+			color: var(--text-light);
+			line-height: 1.6;
+			transition: background 0.3s ease, color 0.3s ease;
+		}
+
+		.theme-dark body {
+			background: var(--bg-dark);
+			color: var(--text-dark);
+		}
+
+		#app {
+			display: flex;
+			height: 100vh;
+			gap: 0;
+		}
+
+		#sidebar {
+			width: 380px;
+			border-right: 2px solid var(--border-light);
+			padding: 20px;
+			box-sizing: border-box;
+			overflow-y: auto;
+			background: var(--sidebar-light);
+			box-shadow: 2px 0 10px rgba(0,0,0,0.05);
+			transition: background 0.3s ease, border-color 0.3s ease;
+		}
+
+		.theme-dark #sidebar {
+			background: var(--sidebar-dark);
+			border-right-color: var(--border-dark);
+			box-shadow: 2px 0 10px rgba(0,0,0,0.3);
+		}
+
+		#map {
+			flex: 1;
+			position: relative;
+		}
+
+		/* KPI Section */
+		.kpi {
+			display: flex;
+			gap: 12px;
+			margin: 20px 0;
+		}
+
+		.kpi > div {
+			flex: 1;
+			background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+			padding: 16px;
+			border-radius: 12px;
+			text-align: center;
+			color: white;
+			box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+		}
+
+		.kpi .muted {
+			font-size: 12px;
+			opacity: 0.9;
+			font-weight: 500;
+		}
+
+		.kpi div:not(.muted) {
+			font-size: 24px;
+			font-weight: 700;
+			margin-top: 4px;
+		}
+
+		.theme-dark .kpi > div {
+			background: linear-gradient(135deg, #1e3a8a 0%, #7c3aed 100%);
+		}
+
+		/* Toolbar */
+		.toolbar {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			margin-bottom: 16px;
+			padding-bottom: 16px;
+			border-bottom: 2px solid var(--border-light);
+		}
+
+		.theme-dark .toolbar {
+			border-bottom-color: var(--border-dark);
+		}
+
+		.toolbar h3 {
+			font-size: 24px;
+			font-weight: 700;
+			color: var(--primary);
+			display: flex;
+			align-items: center;
+			gap: 8px;
+		}
+
+		/* Theme Toggle */
+		label[for="themeToggle"] {
+			display: flex;
+			align-items: center;
+			gap: 8px;
+			font-size: 13px;
+			cursor: pointer;
+			user-select: none;
+			padding: 8px 12px;
+			border-radius: 8px;
+			transition: background 0.2s;
+		}
+
+		label[for="themeToggle"]:hover {
+			background: rgba(59, 130, 246, 0.1);
+		}
+
+		.theme-dark label[for="themeToggle"]:hover {
+			background: rgba(59, 130, 246, 0.2);
+		}
+
+		/* Orders & Drones */
+		#orders, #drones {
+			min-height: 120px;
+			margin: 16px 0;
+		}
+
+		.order, .drone {
+			padding: 12px;
+			border: 2px solid var(--border-light);
+			margin-bottom: 12px;
+			border-radius: 12px;
+			background: var(--sidebar-light);
+			transition: all 0.2s ease;
+			cursor: pointer;
+		}
+
+		.order:hover, .drone:hover {
+			border-color: var(--primary);
+			transform: translateY(-2px);
+			box-shadow: 0 4px 12px rgba(59, 130, 246, 0.15);
+		}
+
+		.theme-dark .order, .theme-dark .drone {
+			border-color: var(--border-dark);
+			background: #1e293b;
+		}
+
+		.theme-dark .order:hover, .theme-dark .drone:hover {
+			border-color: var(--primary);
+			box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+		}
+
+		/* Form Elements */
+		label {
+			display: block;
+			margin-top: 12px;
+			margin-bottom: 6px;
+			font-size: 13px;
+			font-weight: 600;
+			color: var(--text-light);
+		}
+
+		.theme-dark label {
+			color: var(--text-dark);
+		}
+
+		input, select, textarea {
+			width: 100%;
+			padding: 10px 12px;
+			box-sizing: border-box;
+			border: 2px solid var(--border-light);
+			border-radius: 8px;
+			font-size: 14px;
+			font-family: inherit;
+			background: white;
+			color: var(--text-light);
+			transition: all 0.2s ease;
+		}
+
+		input:focus, select:focus, textarea:focus {
+			outline: none;
+			border-color: var(--primary);
+			box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+		}
+
+		.theme-dark input, .theme-dark select, .theme-dark textarea {
+			background: #0f172a;
+			border-color: var(--border-dark);
+			color: var(--text-dark);
+		}
+
+		.theme-dark input:focus, .theme-dark select:focus, .theme-dark textarea:focus {
+			border-color: var(--primary);
+			box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+		}
+
+		textarea {
+			resize: vertical;
+		}
+
+		/* Buttons */
+		button {
+			padding: 10px 16px;
+			background: var(--primary);
+			color: white;
+			border: none;
+			border-radius: 8px;
+			font-size: 14px;
+			font-weight: 600;
+			cursor: pointer;
+			transition: all 0.2s ease;
+			box-shadow: 0 2px 4px rgba(59, 130, 246, 0.2);
+		}
+
+		button:hover {
+			background: var(--primary-hover);
+			transform: translateY(-1px);
+			box-shadow: 0 4px 8px rgba(59, 130, 246, 0.3);
+		}
+
+		button:active {
+			transform: translateY(0);
+		}
+
+		/* Row Layout */
+		.row {
+			display: flex;
+			gap: 8px;
+			align-items: center;
+		}
+
+		.row > * {
+			flex: 1;
+		}
+
+		/* Muted Text */
+		.muted {
+			color: #64748b;
+			font-size: 12px;
+		}
+
+		.theme-dark .muted {
+			color: #94a3b8;
+		}
+
+		/* Section */
+		.section {
+			margin-bottom: 20px;
+			padding: 16px;
+			background: rgba(59, 130, 246, 0.03);
+			border-radius: 12px;
+			border: 1px solid rgba(59, 130, 246, 0.1);
+		}
+
+		.theme-dark .section {
+			background: rgba(59, 130, 246, 0.05);
+			border-color: rgba(59, 130, 246, 0.2);
+		}
+
+		.section h4 {
+			font-size: 18px;
+			font-weight: 700;
+			margin-bottom: 12px;
+			color: var(--primary);
+		}
+
+		/* Headings */
+		h4 {
+			font-size: 18px;
+			font-weight: 700;
+			margin: 20px 0 12px 0;
+			color: var(--text-light);
+			display: flex;
+			align-items: center;
+			gap: 8px;
+		}
+
+		.theme-dark h4 {
+			color: var(--text-dark);
+		}
+
+		/* Pills */
+		.pill {
+			display: inline-block;
+			padding: 4px 10px;
+			border-radius: 12px;
+			font-size: 11px;
+			font-weight: 600;
+			margin-left: 6px;
+		}
+
+		.pill.good {
+			background: #d1fae5;
+			color: #065f46;
+		}
+
+		.theme-dark .pill.good {
+			background: #064e3b;
+			color: #6ee7b7;
+		}
+
+		.pill.warn {
+			background: #fef3c7;
+			color: #92400e;
+		}
+
+		.theme-dark .pill.warn {
+			background: #78350f;
+			color: #fbbf24;
+		}
+
+		.pill.bad {
+			background: #fee2e2;
+			color: #991b1b;
+		}
+
+		.theme-dark .pill.bad {
+			background: #7f1d1d;
+			color: #fca5a5;
+		}
+
+		/* HR */
+		hr {
+			border: none;
+			border-top: 2px solid var(--border-light);
+			margin: 24px 0;
+		}
+
+		.theme-dark hr {
+			border-top-color: var(--border-dark);
+		}
+
+		/* Scrollbar */
+		#sidebar::-webkit-scrollbar {
+			width: 8px;
+		}
+
+		#sidebar::-webkit-scrollbar-track {
+			background: transparent;
+		}
+
+		#sidebar::-webkit-scrollbar-thumb {
+			background: #cbd5e1;
+			border-radius: 4px;
+		}
+
+		.theme-dark #sidebar::-webkit-scrollbar-thumb {
+			background: #475569;
+		}
+
+		#sidebar::-webkit-scrollbar-thumb:hover {
+			background: #94a3b8;
+		}
+
+		.theme-dark #sidebar::-webkit-scrollbar-thumb:hover {
+			background: #64748b;
+		}
+
+		/* Drone Icon */
+		.drone-icon {
+			background: transparent !important;
+			border: none !important;
+		}
+
+		/* Animations */
+		@keyframes pulse {
+			0%, 100% { opacity: 1; }
+			50% { opacity: 0.5; }
+		}
+
+		.order.pending {
+			animation: pulse 2s infinite;
+		}
+
+		/* Status Colors */
+		.order b {
+			color: var(--primary);
+			font-weight: 600;
+		}
+
+		/* Mobile Responsive */
+		@media (max-width: 768px) {
+			#app {
+				flex-direction: column;
+			}
+
+			#sidebar {
+				width: 100%;
+				max-height: 40vh;
+			}
+
+			#map {
+				height: 60vh;
+			}
+		}
 	</style>
 </head>
 <body>
 <div id="app">
 	<div id="sidebar">
         <div class="toolbar">
-            <h3>Заказы</h3>
-            <label style="margin:0;display:flex;gap:6px;align-items:center;font-size:12px;">
+            <h3>🚁 Заказы</h3>
+            <label style="margin:0" for="themeToggle">
                 <input type="checkbox" id="themeToggle"/>
-                Тёмная тема
+                🌙
             </label>
         </div>
         <div class="kpi">
-            <div><div class="muted">Город</div><div id="kpiCity">—</div></div>
-            <div><div class="muted">Дронов</div><div id="kpiDrones">0</div></div>
-            <div><div class="muted">Заказов</div><div id="kpiOrders">0</div></div>
+            <div>
+                <div class="muted">Город</div>
+                <div id="kpiCity">—</div>
+            </div>
+            <div>
+                <div class="muted">Дронов</div>
+                <div id="kpiDrones">0</div>
+            </div>
+            <div>
+                <div class="muted">Заказов</div>
+                <div id="kpiOrders">0</div>
+            </div>
         </div>
 		<div id="orders"></div>
 		<hr />
-        <h4>Дроны</h4>
+        <h4>🎯 Дроны</h4>
         <div id="drones"></div>
         <hr />
         <div class="section">
-            <h4>База и инвентарь</h4>
+            <h4>🏠 База и инвентарь</h4>
             <label>Координаты базы</label>
             <div class="row">
                 <input id="base" placeholder="48.7080, 44.5133"/>
-                <button onclick="useClick('base')">На карте</button>
+                <button onclick="useClick('base')">📍</button>
             </div>
             <div class="row">
-                <input id="invCargo" type="number" min="0" value="2"/>
-                <input id="invOperator" type="number" min="0" value="1"/>
-                <input id="invCleaner" type="number" min="0" value="0"/>
+                <input id="invCargo" type="number" min="0" value="2" placeholder="Груз"/>
+                <input id="invOperator" type="number" min="0" value="1" placeholder="Операт."/>
+                <input id="invCleaner" type="number" min="0" value="0" placeholder="Мойщ."/>
             </div>
-            <div class="muted">cargo • operator • cleaner</div>
-            <button onclick="saveBase()">Сохранить базу</button>
+            <div class="muted">Грузовые • Операторские • Мойщики</div>
+            <button onclick="saveBase()">💾 Сохранить базу</button>
         </div>
         <hr />
-        <h4>Добавить заказ</h4>
-        <label>Откуда (широта, долгота или адрес)</label>
+        <h4>➕ Добавить заказ</h4>
+        <label>📍 Откуда (широта, долгота или адрес)</label>
         <input id="from" placeholder="48.7, 44.5 или адрес" />
-        <label>Куда (широта, долгота или адрес)</label>
+        <label>📍 Куда (широта, долгота или адрес)</label>
         <input id="to" placeholder="48.7, 44.6 или адрес" />
         <div class="row">
-            <button onclick="useClick('from')">Выбрать Откуда</button>
-            <button onclick="useClick('to')">Выбрать Куда</button>
+            <button onclick="useClick('from')">📍 Откуда</button>
+            <button onclick="useClick('to')">📍 Куда</button>
         </div>
-        <label>Тип</label>
+        <label>🗂️ Тип</label>
 		<select id="type">
-            <option value="delivery">доставка</option>
-            <option value="shooting">съёмка</option>
-            <option value="work">работа</option>
+            <option value="delivery">🚚 доставка</option>
+            <option value="shooting">📷 съёмка</option>
+            <option value="work">🔧 работа</option>
 		</select>
-        <label>Батарея %</label>
+        <label>🔋 Батарея %</label>
 		<input id="battery" type="number" min="1" max="100" value="100" />
-        <label>Промежуточные точки (улицы/адреса, по одной в строке)</label>
-        <textarea id="waypoints" rows="3" placeholder="ул. Пример, 1\nул. Вторая, 5"></textarea>
+        <label>📍 Промежуточные точки (улицы/адреса, по одной в строке)</label>
+        <textarea id="waypoints" rows="3" placeholder="ул. Пример, 1&#10;ул. Вторая, 5"></textarea>
         <div class="row">
-            <input id="batchCount" type="number" min="1" max="10" value="1" />
-            <button onclick="submitOrder()">Отправить</button>
+            <input id="batchCount" type="number" min="1" max="10" value="1" placeholder="Кол-во"/>
+            <button onclick="submitOrder()">✅ Отправить</button>
         </div>
 		<hr />
-        <h4>Бесполётные зоны</h4>
-        <p>Shift + зажатая левая кнопка — нарисовать прямоугольник</p>
-        <button onclick="clearZones()">Очистить зоны</button>
+        <h4>🚫 Бесполётные зоны</h4>
+        <p class="muted">Shift + зажатая левая кнопка — нарисовать прямоугольник</p>
+        <button onclick="clearZones()">🗑️ Очистить зоны</button>
 		<hr />
-        <h4>Станции зарядки</h4>
-        <p>Alt + зажатая левая кнопка — добавить станцию. Ctrl + клик — удалить ближайшую.</p>
+        <h4>⚡ Станции зарядки</h4>
+        <p class="muted">Alt + зажатая левая кнопка — добавить станцию. Ctrl + клик — удалить ближайшую.</p>
         <div class="row">
-            <button onclick="pushStations()">Сохранить станции</button>
-            <button onclick="clearStations()">Очистить станции</button>
+            <button onclick="pushStations()">💾 Сохранить</button>
+            <button onclick="clearStations()">🗑️ Очистить</button>
         </div>
-        <label>Массовое добавление (по одной координате в строке: lat, lon)</label>
-        <textarea id="stationsBulk" rows="3" placeholder="48.700000, 44.500000\n48.710000, 44.520000"></textarea>
-        <button onclick="bulkAddStations()">Добавить станции из списка</button>
-        <h4>Город</h4>
+        <label>📍 Массовое добавление (по одной координате в строке: lat, lon)</label>
+        <textarea id="stationsBulk" rows="3" placeholder="48.700000, 44.500000&#10;48.710000, 44.520000"></textarea>
+        <button onclick="bulkAddStations()">➕ Добавить станции</button>
+        <h4>🌆 Город</h4>
 		<input id="city" value="Volgograd, Russia" />
-        <button onclick="loadCity()">Загрузить</button>
+        <button onclick="loadCity()">🗺️ Загрузить</button>
 	</div>
 	<div id="map"></div>
 </div>
@@ -167,7 +564,7 @@ function updateOrders(orders){
 		d.className = 'order';
         d.innerHTML = `#${i+1} ${o.type} <b>${ruStatus(o.status)}</b><br>${fmt(o.start)} → ${fmt(o.end)}<br>`+
             (o.id?`<span class="muted">${o.id}</span>`:'')+
-            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить точку</button></div>`:(o.status==='completed'?`<div class="muted">выполнен</div>`:''));
+            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить</button></div>`:(o.status==='completed'?`<div class="muted">✅ выполнен</div>`:''));
 		c.appendChild(d);
 	});
 	// keep scroll stable
@@ -235,7 +632,7 @@ function drawStations(){
     stationMarkers.forEach(m=> map.removeLayer(m));
     stationMarkers = [];
     stations.forEach(s=>{
-        const m = L.circleMarker(s, {radius:6, color:'#34A853', weight:2, fillColor:'#34A853', fillOpacity:0.6}).addTo(map).bindTooltip('Станция зарядки');
+        const m = L.circleMarker(s, {radius:6, color:'#34A853', weight:2, fillColor:'#34A853', fillOpacity:0.6}).addTo(map).bindTooltip('⚡ Станция зарядки');
         stationMarkers.push(m);
     });
 }
