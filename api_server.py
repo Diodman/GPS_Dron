@@ -54,6 +54,10 @@ class AddOrderRequest(BaseModel):
 	coords_from: Optional[List[float]] = None  # [lat, lon]
 	coords_to: Optional[List[float]] = None
 	type_hint: Optional[str] = None  # delivery|shooting|work
+	# Явный тип дрона: cargo | operator | cleaner. Если не задан — выводится из type_hint.
+	drone_type: Optional[str] = None
+	# Приоритет (больше = выше приоритет в очереди). По умолчанию 5.
+	priority: int = 5
 	battery_level: float = 100
 	waypoints: Optional[List[List[float]]] = None  # optional waypoint coords [ [lat,lon], ... ]
 
@@ -83,6 +87,51 @@ STATE: Dict[str, Any] = {
 }
 
 # Helpers
+# Краткое описание погоды по коду WMO (Open-Meteo)
+def _weather_code_to_desc(code: int) -> str:
+	codes = {
+		0: "Ясно", 1: "Преим. ясно", 2: "Переменная облачность", 3: "Пасмурно",
+		45: "Туман", 48: "Изморозь", 51: "Морось", 53: "Морось", 55: "Морось",
+		61: "Дождь", 63: "Дождь", 65: "Сильный дождь", 66: "Ледяной дождь", 67: "Ливень",
+		71: "Снег", 73: "Снег", 75: "Снегопад", 77: "Снежные зёрна",
+		80: "Ливень", 81: "Ливень", 82: "Ливень", 85: "Снег", 86: "Снегопад",
+		95: "Гроза", 96: "Гроза с градом", 99: "Гроза с градом",
+	}
+	return codes.get(code, "—")
+
+
+def _fetch_weather_sync(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+	"""Синхронный запрос погоды с Open-Meteo (бесплатный API, без ключа)."""
+	try:
+		import requests
+		url = "https://api.open-meteo.com/v1/forecast"
+		params = {
+			"latitude": lat, "longitude": lon,
+			"current": "relative_humidity_2m,weather_code,wind_speed_10m",
+		}
+		r = requests.get(url, params=params, timeout=5.0)
+		r.raise_for_status()
+		data = r.json()
+		cur = data.get("current") or {}
+		wind_kmh = float(cur.get("wind_speed_10m", 0) or 0)
+		wind_mps = round(wind_kmh / 3.6, 1)
+		humidity = int(cur.get("relative_humidity_2m", 0) or 0)
+		code = int(cur.get("weather_code", 0) or 0)
+		return {
+			"wind_mps": max(0, min(40, wind_mps)),
+			"humidity": max(0, min(100, humidity)),
+			"weather_code": code,
+			"description": _weather_code_to_desc(code),
+		}
+	except Exception as e:
+		logger.warning("fetch_weather_from_api failed: %s", e)
+		return None
+
+
+async def fetch_weather_from_api(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+	return await asyncio.to_thread(_fetch_weather_sync, lat, lon)
+
+
 async def broadcast_state():
 	payload = {
 		"city": STATE["city"],
@@ -91,6 +140,7 @@ async def broadcast_state():
 		"histories": {k: v.get("history", []) for k,v in STATE["drones"].items()},
 		"no_fly_zones": STATE["no_fly_zones"],
 		"stations": STATE.get("stations", []),
+		"weather": STATE.get("weather", {}),
 	}
 	dead: List[WebSocket] = []
 	for ws in list(STATE["clients"]):
@@ -227,9 +277,16 @@ async def add_order(order: AddOrderRequest):
 	if not start or not end:
 		return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid start or end"})
 	order_id = f"ord_{len(STATE['orders'])+1}"
+	req_drone_type = (order.drone_type or "").strip().lower() or map_order_to_drone_type(order_type)
+	if req_drone_type not in ("cargo", "operator", "cleaner"):
+		req_drone_type = map_order_to_drone_type(order_type)
+	priority = int(getattr(order, "priority", 5))
+	priority = max(0, min(10, priority))
 	entry = {
 		"id": order_id,
 		"type": order_type,
+		"drone_type": req_drone_type,
+		"priority": priority,
 		"start": start,
 		"end": end,
 		"battery_level": max(1.0, min(100.0, float(order.battery_level))),
@@ -292,11 +349,34 @@ async def root_page():
 		return HTMLResponse("<h3>Client not found. Ensure static/index.html exists.</h3>", status_code=404)
 
 @app.post("/api/weather")
-async def set_weather(w: Dict[str, float]):
+async def set_weather(w: Dict[str, Any]):
 	wind = float(w.get("wind_mps", 3.0))
-	STATE["weather"] = {"wind_mps": max(0.0, min(40.0, wind))}
+	STATE["weather"] = {
+		"wind_mps": max(0.0, min(40.0, wind)),
+		"humidity": STATE["weather"].get("humidity"),
+		"description": STATE["weather"].get("description"),
+		"weather_code": STATE["weather"].get("weather_code"),
+	}
 	await persist_state()
 	return {"ok": True, "weather": STATE["weather"]}
+
+
+@app.get("/api/weather/fetch")
+async def fetch_weather(lat: Optional[float] = None, lon: Optional[float] = None):
+	"""Загрузить погоду из Open-Meteo по координатам (или по базе)."""
+	if lat is None or lon is None:
+		base = STATE.get("base")
+		if base and len(base) == 2:
+			lat, lon = float(base[0]), float(base[1])
+		else:
+			# Волгоград по умолчанию
+			lat, lon = 48.7080, 44.5133
+	data = await fetch_weather_from_api(lat, lon)
+	if data:
+		STATE["weather"] = data
+		await persist_state()
+		return {"ok": True, "weather": STATE["weather"]}
+	return JSONResponse(status_code=502, content={"ok": False, "error": "Weather API unavailable"})
 
 # Base and inventory management
 class BaseConfig(BaseModel):
@@ -370,6 +450,13 @@ def classify_order(order: AddOrderRequest) -> str:
 		return "shooting"
 	return "work"
 
+def _route_length(coords: List[Tuple[float, float]]) -> float:
+	"""Приблизительная длина маршрута в метрах по списку координат."""
+	if not coords or len(coords) < 2:
+		return 0.0
+	return sum(haversine_m(tuple(coords[i]), tuple(coords[i + 1])) for i in range(len(coords) - 1))
+
+
 async def rebuild_graph_with_zones():
 	city = STATE.get("city")
 	if not city:
@@ -385,49 +472,61 @@ async def rebuild_graph_with_zones():
 		logger.exception("Failed to rebuild graph with zones")
 
 async def assign_orders():
-	# Try to assign queued orders to available drones or spawn new
+	# Очередь заказов: назначаем только на свободный дрон нужной категории; приоритет — по полю priority (больше = раньше).
 	city = STATE.get("city")
 	G = STATE.get("city_graph")
 	if not city or G is None:
 		return
 	queue = [o for o in STATE["orders"] if o.get("status") == "queued"]
+	# Сортируем по приоритету (убывание), при равном — по порядку в списке (FIFO)
+	order_indices = {o.get("id"): i for i, o in enumerate(STATE["orders"])}
+	queue = sorted(queue, key=lambda o: (-o.get("priority", 0), order_indices.get(o.get("id"), 0)))
 	for order in queue:
-		# Choose drone: nearest idle or create new
-		drone_id = pick_drone_for_order(order)
+		required_type = order.get("drone_type") or map_order_to_drone_type(order.get("type", "delivery"))
+		drone_id = pick_drone_for_order(order, required_type)
 		if drone_id is None:
-			# Try spawn from inventory at base
-			pref_type = map_order_to_drone_type(order["type"])
-			drone_id = spawn_drone_from_inventory(pref_type)
-			if drone_id is None:
-				# fallback: create at order start
-				drone_id = f"drone_{len(STATE['drones'])+1}"
-				STATE["drones"][drone_id] = {
-					"pos": order["start"],
-					"type": pref_type,
-					"battery": order["battery_level"],
-					"route": [],
-					"target_idx": 0,
-					"status": "idle",
-				}
-		# Plan route with energy-aware via base/stations
-		path, coords, length = plan_via_base_if_needed(order["start"], order["end"], STATE["drones"][drone_id]["type"], STATE["drones"][drone_id]["battery"])
-		if coords:
-			# Ensure the drone stops at the first charger on the way and charges before continuing
-			apply_midroute_charging(STATE["drones"][drone_id], coords)
+			# Свободного дрона нужной категории нет — заказ остаётся в очереди
+			continue
+		# Строим маршрут: от текущей позиции дрона → точка старта заказа → точка доставки (без лишнего заезда на базу)
+		drone = STATE["drones"][drone_id]
+		_, coords_to_start, _ = plan_route_for(drone["pos"], order["start"], drone["type"], drone["battery"])
+		_, coords_start_to_end, length_seg = plan_via_base_if_needed(order["start"], order["end"], drone["type"], drone["battery"])
+		if coords_to_start and coords_start_to_end:
+			# Склеиваем: дрон → старт заказа → доставка (без дублирования точки старта)
+			full_coords = list(coords_to_start) + list(coords_start_to_end)[1:]
+			length = (length_seg + _route_length(coords_to_start)) if coords_to_start else length_seg
+			apply_midroute_charging(drone, full_coords)
 			order["status"] = "assigned"
 			order["drone_id"] = drone_id
 			order["route_length"] = length
+			order["pickup_waypoint_count"] = len(coords_to_start)  # загружен после стольких прибытий
+			drone["loaded_after_waypoint_count"] = len(coords_to_start)
+			drone["waypoints_completed"] = 0
+		elif coords_start_to_end:
+			# дрон уже у точки старта или граф не дал путь от дрона — строим только старт→конец
+			apply_midroute_charging(drone, coords_start_to_end)
+			order["status"] = "assigned"
+			order["drone_id"] = drone_id
+			order["route_length"] = length_seg
+			order["pickup_waypoint_count"] = 0  # уже на старте — сразу загружен
+			drone["loaded_after_waypoint_count"] = 0
+			drone["waypoints_completed"] = 0
 
-def pick_drone_for_order(order: Dict[str, Any]) -> Optional[str]:
-	# pick nearest idle drone; return None if none
+def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Optional[str]:
+	# Выбираем ближайший свободный дрон заданной категории (cargo/operator/cleaner).
 	best = None
 	best_dist = float('inf')
 	for drone_id, d in STATE["drones"].items():
-		if d.get("status") in (None, "idle") and d.get("pos"):
-			dist = haversine_m(d["pos"], order["start"])
-			if dist < best_dist:
-				best_dist = dist
-				best = drone_id
+		if d.get("type") != required_drone_type:
+			continue
+		if d.get("status") not in (None, "idle"):
+			continue
+		if not d.get("pos"):
+			continue
+		dist = haversine_m(d["pos"], order["start"])
+		if dist < best_dist:
+			best_dist = dist
+			best = drone_id
 	return best
 
 
@@ -467,36 +566,32 @@ def plan_via_base_if_needed(current: Tuple[float,float], end: Tuple[float,float]
     base = STATE.get("base")
     if not base:
         return plan_route_for(current, end, drone_type, battery_level)
-    # naive: if remaining straight route exceeds 60% of max range, insert base as waypoint
     _, coords_direct, length_direct = plan_route_for(current, end, drone_type, battery_level)
     if not coords_direct:
         return None, None, 0.0
-    # energy-aware: account for consumption; require 20% reserve to nearest station/base after delivery
     per = {
         "cargo": 2000.0,
         "operator": 2500.0,
         "cleaner": 3000.0,
     }.get(drone_type, 2000.0)
-    usable_range = per * (battery_level/100.0) * 0.9  # 10% enroute headroom
+    usable_range = per * (battery_level/100.0) * 0.9
+    max_range = per * (battery_level/100.0)
+    # Не вставляем базу/станцию, если заряда хватает и маршрут не очень длинный — летим сразу в точку доставки
     if length_direct <= usable_range and can_escape_after(end, drone_type):
         return None, coords_direct, length_direct
-    # candidates: base + stations
+    if battery_level >= 50.0 and length_direct <= 0.85 * max_range:
+        return None, coords_direct, length_direct
+    # Кандидаты на дозаряд: только те, что не совпадают с текущей позицией (не отправляем "на базу" если уже на ней)
     candidates: List[Tuple[float,float]] = []
-    if base:
-        candidates.append(tuple(base))
-    for s in STATE.get("stations", []):
-        try:
-            candidates.append(tuple(s))
-        except Exception:
-            pass
-    # pick candidate with feasible legs current->cand and cand->end
+    for cand in [tuple(base)] + [tuple(s) for s in STATE.get("stations", []) if isinstance(s, (list, tuple)) and len(s) == 2]:
+        if haversine_m(current, cand) >= 25.0:
+            candidates.append(cand)
     best = None
     best_len = float('inf')
     for cand in candidates:
         _, c1, l1 = plan_route_for(current, cand, drone_type, battery_level)
         if not c1:
             continue
-        # Assume charge at station to 100%
         _, c2, l2 = plan_route_for(cand, end, drone_type, 100.0)
         if c2 and (l1 + l2) < best_len:
             best = (c1 + c2, l1 + l2)
@@ -540,6 +635,9 @@ def simulate_step():
 	if not city or G is None:
 		return
 	for drone_id, drone in STATE["drones"].items():
+		if drone.get("status") == "avoidance":
+			_avoidance_step(drone_id, drone)
+			continue
 		if drone.get("status") != "enroute":
 			continue
 		route = drone.get("route") or []
@@ -574,6 +672,7 @@ def simulate_step():
 			# Arrive this tick
 			drone["pos"] = target
 			drone["target_idx"] = idx + 1
+			drone["waypoints_completed"] = drone.get("waypoints_completed", 0) + 1
 			if drone["target_idx"] >= len(route):
 				# If arrived at station/base, join queue or charge
 				if is_at_any_station(drone["pos"]) or (STATE.get("base") and haversine_m(drone["pos"], tuple(STATE["base"])) < 20.0):
@@ -581,6 +680,8 @@ def simulate_step():
 					drone["status"] = "charging"
 				else:
 					drone["status"] = "idle"
+					# Дрон доставил груз — отмечаем заказ выполненным
+					mark_order_completed_if_any(drone_id)
 			else:
 				drone["status"] = "enroute"
 			battery_drain(drone, dist)
@@ -588,10 +689,11 @@ def simulate_step():
 			# Move fractionally and apply basic collision avoidance
 			next_pos = move_towards(current, target, speed_mps / dist)
 			if will_collide(drone_id, next_pos):
-				# simple sidestep: pause this tick
 				drone["status"] = "avoidance"
+				drone["avoidance_ticks"] = drone.get("avoidance_ticks", 0) + 1
 			else:
 				drone["pos"] = next_pos
+				drone["avoidance_ticks"] = 0
 			battery_drain(drone, speed_mps)
 		# link quality estimation vs. nearest base or last strong point
 		compute_link_quality(drone)
@@ -622,6 +724,43 @@ def simulate_step():
 
 
 
+def _avoidance_step(drone_id: str, drone: Dict[str, Any]) -> None:
+	"""Выход из мёртвой блокировки «обход препятствия»: через 2 тика делаем боковой сдвиг."""
+	ticks = drone.get("avoidance_ticks", 0) + 1
+	drone["avoidance_ticks"] = ticks
+	if ticks < 2:
+		return
+	route = drone.get("route") or []
+	idx = drone.get("target_idx", 0)
+	if not route or idx >= len(route):
+		drone["status"] = "idle"
+		drone["avoidance_ticks"] = 0
+		return
+	current = drone["pos"]
+	target = route[idx]
+	dist = haversine_m(current, target)
+	if dist < 1.0:
+		drone["avoidance_ticks"] = 0
+		return
+	# Перпендикуляр к направлению на цель (сдвиг ~5 м вбок)
+	dx = target[0] - current[0]
+	dy = target[1] - current[1]
+	norm = (dx * dx + dy * dy) ** 0.5
+	if norm < 1e-9:
+		drone["avoidance_ticks"] = 0
+		drone["status"] = "enroute"
+		return
+	# Сдвиг на ~0.00005 градуса (примерно 5 м)
+	offset = 0.00005 * (1 if (hash(drone_id) % 2 == 0) else -1)
+	side_lat = current[0] - (dy / norm) * offset
+	side_lon = current[1] + (dx / norm) * offset
+	sidestep = (side_lat, side_lon)
+	if not will_collide(drone_id, sidestep):
+		drone["pos"] = sidestep
+		drone["status"] = "enroute"
+	drone["avoidance_ticks"] = 0
+
+
 def will_collide(drone_id: str, next_pos: Tuple[float,float]) -> bool:
 	for other_id, other in STATE["drones"].items():
 		if other_id == drone_id:
@@ -631,13 +770,22 @@ def will_collide(drone_id: str, next_pos: Tuple[float,float]) -> bool:
 	return False
 
 
+def _is_drone_loaded(drone: Dict[str, Any]) -> bool:
+	"""Дрон загружен, если уже проехал не менее loaded_after_waypoint_count точек (едет к точке доставки)."""
+	after = drone.get("loaded_after_waypoint_count", 0)
+	completed = drone.get("waypoints_completed", 0)
+	return completed >= after
+
+
 def battery_drain(drone: Dict[str, Any], distance_m: float):
-	# very rough: 1% per 2000 m for cargo, 1% per 2500 m operator, 1% per 3000 m cleaner
-	per = {
-		"cargo": 2000.0,
-		"operator": 2500.0,
-		"cleaner": 3000.0,
-	}.get(drone["type"], 2000.0)
+	# Разный расход: пустой дрон экономичнее, загруженный — больше расход
+	base_per = {
+		"cargo": (2000.0, 1400.0),      # (м на 1% пустой, м на 1% загруженный)
+		"operator": (2500.0, 1800.0),
+		"cleaner": (3000.0, 2200.0),
+	}.get(drone["type"], (2000.0, 1400.0))
+	loaded = _is_drone_loaded(drone)
+	per = base_per[1] if loaded else base_per[0]
 	drain = (distance_m / per) * 100.0
 	drone["battery"] = max(0.0, drone["battery"] - drain)
 	# temperature/mock telemetry drift

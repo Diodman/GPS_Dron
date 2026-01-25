@@ -401,6 +401,21 @@
 			animation: pulse 2s infinite;
 		}
 
+		.order-completed {
+			border-color: var(--success);
+			background: rgba(16, 185, 129, 0.06);
+			opacity: 0.95;
+		}
+		.theme-dark .order-completed {
+			background: rgba(16, 185, 129, 0.12);
+		}
+		.order-done-label {
+			margin-top: 8px;
+			font-weight: 600;
+			color: var(--success);
+			font-size: 14px;
+		}
+
 		/* Status Colors */
 		.order b {
 			color: var(--primary);
@@ -448,6 +463,16 @@
                 <div id="kpiOrders">0</div>
             </div>
         </div>
+        <div class="section weather-panel">
+            <h4>🌤️ Погода</h4>
+            <div id="weatherInfo">
+                <div><span class="muted">Погода:</span> <span id="weatherDesc">—</span></div>
+                <div><span class="muted">Влажность:</span> <span id="weatherHumidity">—</span>%</div>
+                <div><span class="muted">Ветер:</span> <span id="weatherWind">—</span> м/с</div>
+            </div>
+            <button type="button" onclick="refreshWeather()" style="margin-top:8px">🔄 Обновить погоду</button>
+        </div>
+        <p class="muted" style="margin-bottom:8px">Заказы в очереди ждут свободный дрон выбранной категории; выше приоритет — раньше выполнится.</p>
 		<div id="orders"></div>
 		<hr />
         <h4>🎯 Дроны</h4>
@@ -478,12 +503,27 @@
             <button onclick="useClick('from')">📍 Откуда</button>
             <button onclick="useClick('to')">📍 Куда</button>
         </div>
-        <label>🗂️ Тип</label>
+        <label>🗂️ Тип заказа</label>
 		<select id="type">
             <option value="delivery">🚚 доставка</option>
             <option value="shooting">📷 съёмка</option>
             <option value="work">🔧 работа</option>
 		</select>
+        <label>🚁 Тип дрона (категория для очереди)</label>
+		<select id="droneType">
+            <option value="">По типу заказа</option>
+            <option value="cargo">🚚 Грузовой</option>
+            <option value="operator">📷 Операторский</option>
+            <option value="cleaner">🔧 Мойщик</option>
+		</select>
+        <label>⚡ Приоритет (1–10, больше = выше в очереди)</label>
+		<select id="priority">
+            <option value="1">1 — низкий</option>
+            <option value="3">3</option>
+            <option value="5" selected>5 — средний</option>
+            <option value="7">7</option>
+            <option value="10">10 — высокий</option>
+        </select>
         <label>🔋 Батарея %</label>
 		<input id="battery" type="number" min="1" max="100" value="100" />
         <label>📍 Промежуточные точки (улицы/адреса, по одной в строке)</label>
@@ -550,6 +590,7 @@ ws.onmessage = ev => {
     document.getElementById('kpiCity').textContent = s.city || '—';
     document.getElementById('kpiDrones').textContent = Object.keys(s.drones||{}).length;
     document.getElementById('kpiOrders').textContent = (s.orders||[]).length;
+    updateWeatherUI(s.weather);
 };
 	ws.onclose = ()=> setTimeout(connectWS, 1000);
 }
@@ -561,16 +602,46 @@ function updateOrders(orders){
 	c.innerHTML = '';
     orders.forEach((o, i)=>{
 		const d = document.createElement('div');
-		d.className = 'order';
-        d.innerHTML = `#${i+1} ${o.type} <b>${ruStatus(o.status)}</b><br>${fmt(o.start)} → ${fmt(o.end)}<br>`+
+		d.className = 'order' + (o.status === 'completed' ? ' order-completed' : '');
+        const droneTypeLabel = droneTypeRu(o.drone_type || '');
+        const prio = o.priority != null ? o.priority : 5;
+        d.innerHTML = `#${i+1} <span class="pill ${prio >= 7 ? 'warn' : (prio <= 3 ? 'bad' : 'good')}">${prio}</span> ${o.type} · ${droneTypeLabel} <b>${ruStatus(o.status)}</b><br>${fmt(o.start)} → ${fmt(o.end)}<br>`+
             (o.id?`<span class="muted">${o.id}</span>`:'')+
-            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить</button></div>`:(o.status==='completed'?`<div class="muted">✅ выполнен</div>`:''));
+            (o.status==='queued'||o.status==='assigned'?`<div class="row"><button onclick="cancelOrder('${o.id}')">Отменить</button><button onclick="pickNewDestination('${o.id}')">Сменить</button></div>`:(o.status==='completed'?`<div class="order-done-label">✅ Завершён</div>`:''));
 		c.appendChild(d);
 	});
 	// keep scroll stable
 	c.scrollTop = Math.min(prevTop, c.scrollHeight - (prevHeight - prevTop));
 }
 function fmt(p){ return p ? `${p[0].toFixed(5)}, ${p[1].toFixed(5)}` : '-'; }
+
+function droneIconHtml(droneType, color){
+    const base = 'width:18px;height:18px;border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,.4);box-sizing:border-box';
+    if (droneType === 'operator') {
+        return `<div style="${base};background:${color};border-radius:50%"></div>`;
+    }
+    if (droneType === 'cleaner') {
+        return `<div style="${base};background:transparent;border: none; box-shadow: none;"><div style="width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-bottom:18px solid ${color};margin:0 auto;filter:drop-shadow(0 0 4px rgba(0,0,0,.4))"></div></div>`;
+    }
+    return `<div style="${base};background:${color};border-radius:0"></div>`;
+}
+
+function updateWeatherUI(w){
+    if (!w) return;
+    const desc = document.getElementById('weatherDesc');
+    const humidity = document.getElementById('weatherHumidity');
+    const wind = document.getElementById('weatherWind');
+    if (desc) desc.textContent = w.description != null ? w.description : (w.weather_code != null ? '—' : '—');
+    if (humidity) humidity.textContent = w.humidity != null ? w.humidity : '—';
+    if (wind) wind.textContent = w.wind_mps != null ? w.wind_mps : '—';
+}
+async function refreshWeather(){
+    try {
+        const r = await fetch('/api/weather/fetch');
+        const j = await r.json();
+        if (j.weather) updateWeatherUI(j.weather);
+    } catch(e) { console.warn('refreshWeather failed', e); }
+}
 
 function updateDrones(drones){
 	// do not reset arrays drastically; remove previous polylines
@@ -587,7 +658,8 @@ function updateDrones(drones){
         const id = ids[idx];
         const d = drones[id];
         const color = palette[idx % palette.length];
-        const icon = L.divIcon({className:'drone-icon', html:`<div style="width:18px;height:18px;background:${color};border-radius:50%;border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,.4)"></div>`});
+        const iconHtml = droneIconHtml(d.type, color);
+        const icon = L.divIcon({className:'drone-icon', html: iconHtml});
         if (!droneMarkers[id]){
             droneMarkers[id] = L.marker(d.pos,{icon}).addTo(map).bindPopup(id);
         }else{
@@ -654,6 +726,9 @@ async function submitOrder(){
     const f = document.getElementById('from').value.trim();
     const t = document.getElementById('to').value.trim();
     const type = document.getElementById('type').value;
+    const droneTypeEl = document.getElementById('droneType');
+    const droneType = droneTypeEl && droneTypeEl.value ? droneTypeEl.value.trim() : '';
+    const priority = parseInt(document.getElementById('priority').value||'5', 10);
     const battery = parseFloat(document.getElementById('battery').value||'100');
     const batch = Math.max(1, Math.min(10, parseInt(document.getElementById('batchCount').value||'1')));
     const waypointsText = (document.getElementById('waypoints').value||'').trim();
@@ -666,7 +741,8 @@ async function submitOrder(){
         }
     }
     for (let i=0;i<batch;i++){
-        const body = { type_hint: type, battery_level: battery };
+        const body = { type_hint: type, battery_level: battery, priority: priority };
+        if (droneType) body.drone_type = droneType;
         const fc = parseMaybeCoords(f); const tc = parseMaybeCoords(t);
         if (fc) body.coords_from = fc; else body.address_from = f;
         if (tc) body.coords_to = tc; else body.address_to = t;
@@ -778,8 +854,13 @@ themeToggle.addEventListener('change', ()=>{
 
 function ruStatus(s){
     return ({
-        'idle':'свободен', 'enroute':'в пути', 'avoidance':'обход препятствия', 'holding':'ожидание', 'low_battery':'низкий заряд', 'assigned':'назначен', 'queued':'в очереди', 'cancelled':'отменён'
+        'idle':'свободен', 'enroute':'в пути', 'avoidance':'обход препятствия', 'holding':'ожидание', 'low_battery':'низкий заряд',
+        'charging':'зарядка', 'return_base':'возврат на базу', 'return_charge':'на зарядку',
+        'assigned':'назначен', 'queued':'в очереди', 'cancelled':'отменён', 'completed':'выполнен'
     })[s]||s;
+}
+function droneTypeRu(t){
+    return ({ 'cargo':'грузовой', 'operator':'операторский', 'cleaner':'мойщик' })[t]||t||'—';
 }
 
 function focusDrone(id){
@@ -816,12 +897,16 @@ async function saveBase(){
 
 // Автозагрузка города при старте (для удобства)
 window.addEventListener('load', ()=>{ loadCity(); });
-// Load base and stations on startup to populate UI quickly
+// Load base, stations and weather on startup to populate UI quickly
 window.addEventListener('load', async ()=>{
     try{
         const r = await fetch('/api/base'); const j = await r.json();
         if (j.base){ const [lat, lon] = j.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`; }
         if (Array.isArray(j.stations)){ stations = j.stations; drawStations(); }
+    }catch(e){}
+    try{
+        const s = await fetch('/api/state').then(x=>x.json());
+        if (s.weather) updateWeatherUI(s.weather);
     }catch(e){}
 });
 </script>
