@@ -65,6 +65,32 @@
 			box-shadow: 2px 0 10px rgba(0,0,0,0.3);
 		}
 
+		#rightPanel {
+			width: 320px;
+			border-left: 2px solid var(--border-light);
+			border-right: 2px solid var(--border-light);
+			padding: 20px;
+			box-sizing: border-box;
+			overflow-y: auto;
+			background: var(--sidebar-light);
+			box-shadow: -2px 0 10px rgba(0,0,0,0.05);
+			transition: background 0.3s ease, border-color 0.3s ease;
+			display: flex;
+			flex-direction: column;
+			gap: 16px;
+		}
+
+		.theme-dark #rightPanel {
+			background: var(--sidebar-dark);
+			border-left-color: var(--border-dark);
+			border-right-color: var(--border-dark);
+			box-shadow: -2px 0 10px rgba(0,0,0,0.3);
+		}
+
+		#rightPanel .section {
+			margin-bottom: 0;
+		}
+
 		#map {
 			flex: 1;
 			position: relative;
@@ -153,12 +179,25 @@
 			margin: 16px 0;
 		}
 
+		#rightPanel #orders {
+			flex: 1;
+			min-height: 200px;
+		}
+
+		#weatherInfo div {
+			color: var(--text-light);
+		}
+		.theme-dark #weatherInfo div {
+			color: var(--text-dark);
+		}
+
 		.order, .drone {
 			padding: 12px;
 			border: 2px solid var(--border-light);
 			margin-bottom: 12px;
 			border-radius: 12px;
 			background: var(--sidebar-light);
+			color: var(--text-light);
 			transition: all 0.2s ease;
 			cursor: pointer;
 		}
@@ -179,14 +218,14 @@
 			box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
 		}
 
-		/* Form Elements */
+		/* Form Elements - читаемо на белом */
 		label {
 			display: block;
 			margin-top: 12px;
 			margin-bottom: 6px;
 			font-size: 13px;
 			font-weight: 600;
-			color: var(--text-light);
+			color: #1e293b;
 		}
 
 		.theme-dark label {
@@ -251,6 +290,14 @@
 			transform: translateY(0);
 		}
 
+		.mode-btn.active {
+			background: var(--success);
+			box-shadow: 0 2px 4px rgba(16, 185, 129, 0.3);
+		}
+		.mode-btn.active:hover {
+			background: #0d9668;
+		}
+
 		/* Row Layout */
 		.row {
 			display: flex;
@@ -262,43 +309,49 @@
 			flex: 1;
 		}
 
-		/* Muted Text */
+		/* Muted Text - читаемо на белом и тёмном */
 		.muted {
-			color: #64748b;
+			color: #475569;
 			font-size: 12px;
+			font-weight: 500;
 		}
 
 		.theme-dark .muted {
 			color: #94a3b8;
 		}
 
-		/* Section */
+		/* Section - контраст на белом */
 		.section {
 			margin-bottom: 20px;
 			padding: 16px;
-			background: rgba(59, 130, 246, 0.03);
+			background: rgba(59, 130, 246, 0.06);
 			border-radius: 12px;
-			border: 1px solid rgba(59, 130, 246, 0.1);
+			border: 1px solid rgba(59, 130, 246, 0.2);
+			color: var(--text-light);
 		}
 
 		.theme-dark .section {
 			background: rgba(59, 130, 246, 0.05);
 			border-color: rgba(59, 130, 246, 0.2);
+			color: var(--text-dark);
 		}
 
 		.section h4 {
 			font-size: 18px;
 			font-weight: 700;
 			margin-bottom: 12px;
+			color: #1d4ed8;
+		}
+		.theme-dark .section h4 {
 			color: var(--primary);
 		}
 
-		/* Headings */
+		/* Headings - контраст на белом фоне */
 		h4 {
 			font-size: 18px;
 			font-weight: 700;
 			margin: 20px 0 12px 0;
-			color: var(--text-light);
+			color: #0f172a;
 			display: flex;
 			align-items: center;
 			gap: 8px;
@@ -319,8 +372,8 @@
 		}
 
 		.pill.good {
-			background: #d1fae5;
-			color: #065f46;
+			background: #a7f3d0;
+			color: #064e3b;
 		}
 
 		.theme-dark .pill.good {
@@ -329,8 +382,8 @@
 		}
 
 		.pill.warn {
-			background: #fef3c7;
-			color: #92400e;
+			background: #fde68a;
+			color: #78350f;
 		}
 
 		.theme-dark .pill.warn {
@@ -339,8 +392,8 @@
 		}
 
 		.pill.bad {
-			background: #fee2e2;
-			color: #991b1b;
+			background: #fecaca;
+			color: #7f1d1d;
 		}
 
 		.theme-dark .pill.bad {
@@ -416,16 +469,43 @@
 			font-size: 14px;
 		}
 
-		/* Status Colors */
+		/* Status Colors - читаемо на белом */
+		.order, .order b {
+			color: var(--text-light);
+		}
 		.order b {
 			color: var(--primary);
 			font-weight: 600;
 		}
+		.theme-dark .order {
+			color: var(--text-dark);
+		}
+		.theme-dark .order b {
+			color: #93c5fd;
+		}
+
+		/* Scrollbar right panel */
+		#rightPanel::-webkit-scrollbar {
+			width: 8px;
+		}
+		#rightPanel::-webkit-scrollbar-track { background: transparent; }
+		#rightPanel::-webkit-scrollbar-thumb {
+			background: #cbd5e1;
+			border-radius: 4px;
+		}
+		.theme-dark #rightPanel::-webkit-scrollbar-thumb {
+			background: #475569;
+		}
 
 		/* Mobile Responsive */
+		@media (max-width: 1200px) {
+			#rightPanel {
+				width: 280px;
+			}
+		}
 		@media (max-width: 768px) {
 			#app {
-				flex-direction: column;
+				flex-wrap: wrap;
 			}
 
 			#sidebar {
@@ -433,8 +513,20 @@
 				max-height: 40vh;
 			}
 
+			#rightPanel {
+				width: 100%;
+				max-height: 35vh;
+				border-left: none;
+				border-right: none;
+				border-top: 2px solid var(--border-light);
+			}
+			.theme-dark #rightPanel {
+				border-top-color: var(--border-dark);
+			}
+
 			#map {
-				height: 60vh;
+				width: 100%;
+				height: 50vh;
 			}
 		}
 	</style>
@@ -463,17 +555,6 @@
                 <div id="kpiOrders">0</div>
             </div>
         </div>
-        <div class="section weather-panel">
-            <h4>🌤️ Погода</h4>
-            <div id="weatherInfo">
-                <div><span class="muted">Погода:</span> <span id="weatherDesc">—</span></div>
-                <div><span class="muted">Влажность:</span> <span id="weatherHumidity">—</span>%</div>
-                <div><span class="muted">Ветер:</span> <span id="weatherWind">—</span> м/с</div>
-            </div>
-            <button type="button" onclick="refreshWeather()" style="margin-top:8px">🔄 Обновить погоду</button>
-        </div>
-        <p class="muted" style="margin-bottom:8px">Заказы в очереди ждут свободный дрон выбранной категории; выше приоритет — раньше выполнится.</p>
-		<div id="orders"></div>
 		<hr />
         <h4>🎯 Дроны</h4>
         <div id="drones"></div>
@@ -550,6 +631,29 @@
 		<input id="city" value="Volgograd, Russia" />
         <button onclick="loadCity()">🗺️ Загрузить</button>
 	</div>
+	<div id="rightPanel">
+        <div class="section battery-mode-panel">
+            <h4>🔋 Режим расхода батареи</h4>
+            <p class="muted" style="margin-bottom:8px">Тест — укороченная дальность для проверки маршрутов через зарядки. Реальность — данные по Wh/km.</p>
+            <div class="row" style="gap:8px; flex-wrap:wrap;">
+                <button type="button" id="btnBatteryTest" onclick="setBatteryMode('test')" class="mode-btn">🧪 Тест</button>
+                <button type="button" id="btnBatteryReality" onclick="setBatteryMode('reality')" class="mode-btn active">📊 Реальность</button>
+            </div>
+            <div class="muted" style="margin-top:6px"><span id="batteryModeLabel">Реальность</span></div>
+        </div>
+        <div class="section weather-panel">
+            <h4>🌤️ Погода</h4>
+            <div id="weatherInfo">
+                <div><span class="muted">Погода:</span> <span id="weatherDesc">—</span></div>
+                <div><span class="muted">Влажность:</span> <span id="weatherHumidity">—</span>%</div>
+                <div><span class="muted">Ветер:</span> <span id="weatherWind">—</span> м/с</div>
+            </div>
+            <button type="button" onclick="refreshWeather()" style="margin-top:8px">🔄 Обновить погоду</button>
+        </div>
+        <h4>📋 Задания</h4>
+        <p class="muted" style="margin-bottom:8px">Заказы в очереди ждут свободный дрон выбранной категории; выше приоритет — раньше выполнится.</p>
+        <div id="orders"></div>
+	</div>
 	<div id="map"></div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -576,6 +680,7 @@ function connectWS(){
 	ws = new WebSocket(`${proto}://${location.host}/ws`);
 ws.onmessage = ev => {
     const s = JSON.parse(ev.data);
+    if (s.battery_mode != null) updateBatteryModeUI(s.battery_mode);
     updateOrders(s.orders||[]);
     window.lastHistories = s.histories || {};
     updateDrones(s.drones||{});
@@ -642,6 +747,21 @@ async function refreshWeather(){
         if (j.weather) updateWeatherUI(j.weather);
     } catch(e) { console.warn('refreshWeather failed', e); }
 }
+async function setBatteryMode(mode){
+    try {
+        const r = await fetch('/api/battery_mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }) });
+        const j = await r.json();
+        if (j.ok) updateBatteryModeUI(j.mode);
+    } catch(e) { console.warn('setBatteryMode failed', e); }
+}
+function updateBatteryModeUI(mode){
+    const testBtn = document.getElementById('btnBatteryTest');
+    const realityBtn = document.getElementById('btnBatteryReality');
+    const label = document.getElementById('batteryModeLabel');
+    if (testBtn) testBtn.classList.toggle('active', mode === 'test');
+    if (realityBtn) realityBtn.classList.toggle('active', mode === 'reality');
+    if (label) label.textContent = mode === 'test' ? 'Тест (укороченная дальность)' : 'Реальность';
+}
 
 function updateDrones(drones){
 	// do not reset arrays drastically; remove previous polylines
@@ -660,11 +780,13 @@ function updateDrones(drones){
         const color = palette[idx % palette.length];
         const iconHtml = droneIconHtml(d.type, color);
         const icon = L.divIcon({className:'drone-icon', html: iconHtml});
+        const droneDisplayName = id.startsWith('drone_') ? (droneTypeRu(d.type) + (id.replace('drone_','')||'1')) : id;
         if (!droneMarkers[id]){
-            droneMarkers[id] = L.marker(d.pos,{icon}).addTo(map).bindPopup(id);
+            droneMarkers[id] = L.marker(d.pos,{icon}).addTo(map).bindPopup(droneDisplayName);
         }else{
             droneMarkers[id].setLatLng(d.pos);
             droneMarkers[id].setIcon(icon);
+            droneMarkers[id].setPopupContent(droneDisplayName);
         }
         if (d.route && d.route.length){
             const poly = L.polyline(d.route, {color}).addTo(map);
@@ -676,11 +798,12 @@ function updateDrones(drones){
         }
         const item = document.createElement('div');
         item.className='drone';
+        const displayName = id.startsWith('drone_') ? (droneTypeRu(d.type) + (id.replace('drone_','')||'1')) : id;
         const eta = d.eta_s!=null?`${Math.round(d.eta_s/60)} мин`:'-';
         const bat = d.battery!=null?`${d.battery.toFixed(0)}%`:'-';
         const lq = d.link_quality!=null?qualityPill(d.link_quality):'';
         const toStreet = (d.route && d.target_idx!=null && d.route[d.target_idx]) ? d.route[d.target_idx] : null;
-        item.innerHTML = `<b>${id}</b> • ${ruStatus(d.status)||'-'} ${lq}<br>`+
+        item.innerHTML = `<b>${displayName}</b> • ${ruStatus(d.status)||'-'} ${lq}<br>`+
             `Заряд: ${bat} • Осталось: ${eta}` + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
         item.onclick = ()=> focusDrone(id);
 		list.appendChild(item);
@@ -899,6 +1022,11 @@ async function saveBase(){
 window.addEventListener('load', ()=>{ loadCity(); });
 // Load base, stations and weather on startup to populate UI quickly
 window.addEventListener('load', async ()=>{
+    try{
+        const modeRes = await fetch('/api/battery_mode');
+        const modeJ = await modeRes.json();
+        if (modeJ.mode) updateBatteryModeUI(modeJ.mode);
+    } catch(e){}
     try{
         const r = await fetch('/api/base'); const j = await r.json();
         if (j.base){ const [lat, lon] = j.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`; }
