@@ -2,6 +2,21 @@ import networkx as nx
 import numpy as np
 from collections import deque
 import logging
+from typing import Dict, List, Optional, Tuple, Any
+
+# Modes for battery consumption: empty (no cargo) vs loaded (with cargo)
+MODE_EMPTY = "empty"
+MODE_LOADED = "loaded"
+
+# Default reserve and charger arrival thresholds (can be overridden in drone params)
+DEFAULT_RESERVE_PCT = 10.0
+DEFAULT_CHARGER_ARRIVAL_MIN_PCT = 5.0
+
+
+BATTERY_MODE_REALITY = "reality"
+BATTERY_MODE_TEST = "test"
+TEST_RANGE_DIVISOR = 8  # в тесте дальность в 8 раз меньше — маршруты почти всегда через зарядки
+
 
 class RoutingService:
     def __init__(self, graph_service):
@@ -9,8 +24,13 @@ class RoutingService:
         self.city_graphs = {}
         self.progress_callbacks = []
         self.active_routes = {}
+        self.battery_mode = BATTERY_MODE_REALITY
         self.logger = logging.getLogger(__name__)
-    
+
+    def set_battery_mode(self, mode: str) -> None:
+        """Режим расхода: 'reality' — реальные данные, 'test' — укороченная дальность для тестов маршрутов."""
+        self.battery_mode = mode if mode in (BATTERY_MODE_REALITY, BATTERY_MODE_TEST) else BATTERY_MODE_REALITY
+
     def add_progress_callback(self, callback):
         self.progress_callbacks.append(callback)
     
@@ -466,9 +486,276 @@ class RoutingService:
             self.logger.debug(f"Ошибка вычисления расстояния между узлами: {e}")
             return 1000.0  # Возвращаем большое значение по умолчанию
     
-    def _get_drone_params(self, drone_type):
-        return {
-            "cargo": {"battery_range": 20000},
-            "operator": {"battery_range": 15000},
-            "cleaner": {"battery_range": 10000}
-        }.get(drone_type, {"battery_range": 20000})
+    def _get_drone_params(self, drone_type: str) -> Dict[str, Any]:
+        """Параметры по реальным данным расхода (Вт·ч/км, время полёта).
+        empty_m_per_pct: метров пути на 1% заряда (пустой). Меньше = выше расход.
+        Грузовой: 150–400 Wh/km, 15–40 мин → ~12 км пустой, ~8 км с грузом.
+        Операторский: 40–120 Wh/km, 20–40 мин → ~20 км / ~15 км.
+        Сервисный: 30–80 Wh/km, 25–60 мин → ~28 км / ~20 км.
+        """
+        params = {
+            "cargo": {
+                "battery_range": 12000,
+                "empty_m_per_pct": 120.0,   # ~12 км на 100%, 1% ≈ 120 м
+                "loaded_m_per_pct": 80.0,   # с грузом ~8 км, 1% ≈ 80 м
+                "reserve_pct": DEFAULT_RESERVE_PCT,
+                "charger_arrival_min_pct": DEFAULT_CHARGER_ARRIVAL_MIN_PCT,
+            },
+            "operator": {
+                "battery_range": 20000,
+                "empty_m_per_pct": 200.0,
+                "loaded_m_per_pct": 150.0,
+                "reserve_pct": DEFAULT_RESERVE_PCT,
+                "charger_arrival_min_pct": DEFAULT_CHARGER_ARRIVAL_MIN_PCT,
+            },
+            "cleaner": {
+                "battery_range": 28000,
+                "empty_m_per_pct": 280.0,
+                "loaded_m_per_pct": 200.0,
+                "reserve_pct": DEFAULT_RESERVE_PCT,
+                "charger_arrival_min_pct": DEFAULT_CHARGER_ARRIVAL_MIN_PCT,
+            },
+        }
+        base = params.get(drone_type, params["cargo"]).copy()
+        for k, v in params["cargo"].items():
+            if k not in base:
+                base[k] = v
+        if self.battery_mode == BATTERY_MODE_TEST:
+            base["empty_m_per_pct"] = base["empty_m_per_pct"] / TEST_RANGE_DIVISOR
+            base["loaded_m_per_pct"] = base["loaded_m_per_pct"] / TEST_RANGE_DIVISOR
+            base["battery_range"] = base.get("battery_range", 20000) / TEST_RANGE_DIVISOR
+        return base
+
+    def compute_battery_after(
+        self,
+        distance_m: float,
+        battery_before_pct: float,
+        mode: str,
+        drone_type: str,
+    ) -> float:
+        """Compute battery level after flying distance_m with given mode. Returns 0..100."""
+        p = self._get_drone_params(drone_type)
+        m_per_pct = p["loaded_m_per_pct"] if mode == MODE_LOADED else p["empty_m_per_pct"]
+        if m_per_pct <= 0:
+            return 0.0
+        drain_pct = (distance_m / m_per_pct)
+        return max(0.0, min(100.0, battery_before_pct - drain_pct))
+
+    def max_reachable_distance(
+        self,
+        battery_pct: float,
+        mode: str,
+        drone_type: str,
+        reserve_pct: Optional[float] = None,
+    ) -> float:
+        """Max distance in meters reachable with given battery, respecting reserve."""
+        p = self._get_drone_params(drone_type)
+        reserve = reserve_pct if reserve_pct is not None else p.get("reserve_pct", DEFAULT_RESERVE_PCT)
+        usable = max(0.0, battery_pct - reserve)
+        m_per_pct = p["loaded_m_per_pct"] if mode == MODE_LOADED else p["empty_m_per_pct"]
+        return usable * m_per_pct
+
+    def plan_segment(
+        self,
+        G: nx.Graph,
+        a_point_or_node: Any,
+        b_point_or_node: Any,
+        max_range_m: float,
+        algorithm: str = "dijkstra",
+    ) -> Tuple[Optional[List], Optional[List], float]:
+        """
+        Plan a single segment on city graph. a/b can be (lat, lon) or node_id.
+        Returns (path_nodes, coords, length_m) or (None, None, 0.0).
+        """
+        if G is None or len(G.nodes) == 0:
+            return None, None, 0.0
+        # Resolve to nodes
+        if isinstance(a_point_or_node, (list, tuple)) and len(a_point_or_node) == 2:
+            a_node = self._find_nearest_node(G, tuple(a_point_or_node))
+        else:
+            a_node = a_point_or_node if a_point_or_node in G.nodes else None
+        if isinstance(b_point_or_node, (list, tuple)) and len(b_point_or_node) == 2:
+            b_node = self._find_nearest_node(G, tuple(b_point_or_node))
+        else:
+            b_node = b_point_or_node if b_point_or_node in G.nodes else None
+        if not a_node or not b_node:
+            return None, None, 0.0
+        if a_node == b_node:
+            pos = G.nodes[a_node]["pos"]
+            return [a_node], [pos], 0.0
+        path = self._find_safe_path(G, a_node, b_node, max_range_m)
+        if not path:
+            return None, None, 0.0
+        coords = [G.nodes[n]["pos"] for n in path]
+        length = self._calculate_path_length(G, path)
+        return path, coords, length
+
+    def build_meta_graph(
+        self,
+        G: nx.Graph,
+        points: Dict[str, Any],
+        start_name: str,
+        charger_names: List[str],
+        battery_pct: float,
+        mode: str,
+        drone_type: str,
+        reserve_pct: Optional[float] = None,
+        max_segment_battery_pct: Optional[float] = None,
+        max_battery_pct_to_reach_charger: Optional[float] = None,
+    ) -> nx.DiGraph:
+        """
+        Build meta-graph H. points: name -> node_id.
+        Edge (a, b) exists if segment a->b is feasible: path exists and length <= max_range.
+        max_range for edges FROM start = max_reachable(battery_pct); FROM charger = max_reachable(100).
+        If max_segment_battery_pct is set (e.g. 50): рёбра из не-зарядки в goal ограничиваем —
+        один сегмент без зарядки не должен «съедать» больше этой доли батареи, иначе путь через станции.
+        If max_battery_pct_to_reach_charger is set (e.g. 85): до зарядки разрешаем лететь с меньшим запасом
+        (оставляем 15%), чтобы дотянуть до станции и там зарядиться — иначе станции «на пути» не используются.
+        """
+        H = nx.DiGraph()
+        p = self._get_drone_params(drone_type)
+        reserve = reserve_pct if reserve_pct is not None else p.get("reserve_pct", DEFAULT_RESERVE_PCT)
+        max_from_start = self.max_reachable_distance(battery_pct, mode, drone_type, reserve_pct=reserve)
+        max_from_charger = self.max_reachable_distance(100.0, mode, drone_type, reserve_pct=reserve)
+        # Макс. дальность одного сегмента без зарядки до цели (чтобы вставлять станции при длинных перегонах)
+        if max_segment_battery_pct is not None and max_segment_battery_pct < 100:
+            reserve_for_direct_goal = 100.0 - max_segment_battery_pct
+            max_direct_to_goal = self.max_reachable_distance(
+                100.0, mode, drone_type, reserve_pct=reserve_for_direct_goal
+            )
+        else:
+            max_direct_to_goal = None
+        # Допустимый запас при полёте до зарядки: можно дотянуть до станции с меньшим резервом
+        if max_battery_pct_to_reach_charger is not None and max_battery_pct_to_reach_charger > 0:
+            reserve_to_charger = 100.0 - max_battery_pct_to_reach_charger
+            max_to_charger_from_start = self.max_reachable_distance(
+                battery_pct, mode, drone_type, reserve_pct=reserve_to_charger
+            )
+            max_to_charger_from_charger = self.max_reachable_distance(
+                100.0, mode, drone_type, reserve_pct=reserve_to_charger
+            )
+        else:
+            max_to_charger_from_start = max_from_start
+            max_to_charger_from_charger = max_from_charger
+        charger_set = set(charger_names)
+        goal_name = "goal"
+
+        names = list(points.keys())
+        for name_a in names:
+            max_dist = max_from_charger if name_a in charger_set else max_from_start
+            for name_b in names:
+                if name_a == name_b:
+                    continue
+                # Перегон в зарядку: разрешаем длиннее сегмент (дотянуть до станции)
+                if name_b in charger_set and max_battery_pct_to_reach_charger is not None:
+                    max_dist_this = max_to_charger_from_charger if name_a in charger_set else max_to_charger_from_start
+                # Прямой перегон в цель без зарядки — не длиннее чем max_segment_battery_pct батареи
+                elif max_direct_to_goal is not None and name_b == goal_name and name_a not in charger_set:
+                    max_dist_this = min(max_dist, max_direct_to_goal)
+                else:
+                    max_dist_this = max_dist
+                path, coords, length = self.plan_segment(
+                    G, points[name_a], points[name_b], max_range_m=max_dist_this, algorithm="dijkstra"
+                )
+                if path is not None and length <= max_dist_this:
+                    H.add_edge(name_a, name_b, weight=length, path=path, coords=coords, length=length)
+        return H
+
+    def plan_with_chargers(
+        self,
+        G: nx.Graph,
+        start_node: Any,
+        goal_node: Any,
+        battery_pct: float,
+        mode: str,
+        drone_type: str,
+        reserve_pct: Optional[float] = None,
+        charger_nodes: Optional[Dict[str, Any]] = None,
+        max_segment_battery_pct: Optional[float] = None,
+        max_battery_pct_to_reach_charger: Optional[float] = None,
+    ) -> Tuple[Optional[List], Optional[List], float, List[str]]:
+        """
+        Plan path from start to goal with optional charging stops (одна или несколько станций).
+        charger_nodes: {"base": node_id or None, "stations": [node_id, ...]}.
+        max_segment_battery_pct: макс. доля батареи на один перегон без зарядки (иначе путь через станции).
+        max_battery_pct_to_reach_charger: допустимая доля батареи на перелёт до зарядки (дотянуть до станции).
+        Returns (full_path_nodes, full_coords, total_length_m, visited_charger_names).
+        """
+        if G is None or not start_node or not goal_node:
+            return None, None, 0.0, []
+        # Resolve to node ids if coords
+        if isinstance(start_node, (list, tuple)) and len(start_node) == 2:
+            start_node = self._find_nearest_node(G, tuple(start_node))
+        if isinstance(goal_node, (list, tuple)) and len(goal_node) == 2:
+            goal_node = self._find_nearest_node(G, tuple(goal_node))
+        if not start_node or start_node not in G.nodes or not goal_node or goal_node not in G.nodes:
+            return None, None, 0.0, []
+
+        points = {"start": start_node, "goal": goal_node}
+        ch = charger_nodes or {}
+        base_node = ch.get("base")
+        station_nodes = ch.get("stations") or []
+        charger_names_list = []
+        if base_node is not None and base_node in G.nodes:
+            points["base"] = base_node
+            charger_names_list.append("base")
+        for i, sn in enumerate(station_nodes):
+            if sn is not None and sn in G.nodes:
+                points[f"station_{i}"] = sn
+                charger_names_list.append(f"station_{i}")
+
+        H = self.build_meta_graph(
+            G, points, "start", charger_names_list, battery_pct, mode, drone_type, reserve_pct,
+            max_segment_battery_pct=max_segment_battery_pct,
+            max_battery_pct_to_reach_charger=max_battery_pct_to_reach_charger,
+        )
+        if "start" not in H or "goal" not in H:
+            return None, None, 0.0, []
+
+        try:
+            path_names = nx.shortest_path(H, "start", "goal", weight="weight")
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return None, None, 0.0, []
+
+        full_path = []
+        full_coords = []
+        total_length = 0.0
+        visited_chargers = []
+        battery = battery_pct
+        m_per_pct = (
+            self._get_drone_params(drone_type)["loaded_m_per_pct"]
+            if mode == MODE_LOADED
+            else self._get_drone_params(drone_type)["empty_m_per_pct"]
+        )
+        charger_names = {"base"} | {f"station_{i}" for i in range(len(station_nodes))}
+
+        for i in range(len(path_names) - 1):
+            a, b = path_names[i], path_names[i + 1]
+            edge_data = H.get_edge_data(a, b)
+            if not edge_data:
+                return None, None, 0.0, []
+            seg_path = edge_data.get("path") or []
+            seg_coords = edge_data.get("coords") or []
+            seg_len = edge_data.get("length", 0.0)
+            if not seg_path:
+                continue
+            # When leaving a charger, battery is 100%
+            if a in charger_names:
+                battery = 100.0
+            drain = (seg_len / m_per_pct) * 100.0
+            battery_after = max(0.0, battery - drain)
+            if battery_after < 0:
+                return None, None, 0.0, []
+            if b in charger_names:
+                visited_chargers.append(b)
+            battery = 100.0 if b in charger_names else battery_after
+
+            if full_path and full_path[-1] == seg_path[0]:
+                full_path.extend(seg_path[1:])
+                full_coords.extend(seg_coords[1:] if seg_coords else [])
+            else:
+                full_path.extend(seg_path)
+                full_coords.extend(seg_coords)
+            total_length += seg_len
+
+        return full_path, full_coords, total_length, visited_chargers
