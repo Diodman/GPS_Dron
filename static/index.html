@@ -438,6 +438,10 @@
 			background: #64748b;
 		}
 
+		.order-form-block {
+			margin-top: 12px;
+		}
+
 		/* Drone Icon */
 		.drone-icon {
 			background: transparent !important;
@@ -569,33 +573,73 @@
             <div class="row">
                 <input id="invCargo" type="number" min="0" value="2" placeholder="Груз"/>
                 <input id="invOperator" type="number" min="0" value="1" placeholder="Операт."/>
-                <input id="invCleaner" type="number" min="0" value="0" placeholder="Мойщ."/>
+                <input id="invCleaner" type="number" min="0" value="0" placeholder="Сервис."/>
             </div>
-            <div class="muted">Грузовые • Операторские • Мойщики</div>
+            <div class="muted">Грузовые • Операторские • Сервисные</div>
             <button onclick="saveBase()">💾 Сохранить базу</button>
         </div>
         <hr />
         <h4>➕ Добавить заказ</h4>
-        <label>📍 Откуда (широта, долгота или адрес)</label>
-        <input id="from" placeholder="48.7, 44.5 или адрес" />
-        <label>📍 Куда (широта, долгота или адрес)</label>
-        <input id="to" placeholder="48.7, 44.6 или адрес" />
-        <div class="row">
-            <button onclick="useClick('from')">📍 Откуда</button>
-            <button onclick="useClick('to')">📍 Куда</button>
-        </div>
-        <label>🗂️ Тип заказа</label>
-		<select id="type">
-            <option value="delivery">🚚 доставка</option>
-            <option value="shooting">📷 съёмка</option>
-            <option value="work">🔧 работа</option>
-		</select>
         <label>🚁 Тип дрона (категория для очереди)</label>
 		<select id="droneType">
             <option value="">По типу заказа</option>
             <option value="cargo">🚚 Грузовой</option>
             <option value="operator">📷 Операторский</option>
-            <option value="cleaner">🔧 Мойщик</option>
+            <option value="cleaner">🔧 Сервисный</option>
+		</select>
+
+        <!-- Грузовой: откуда, куда, промежуточные точки -->
+        <div id="orderFormCargo" class="order-form-block">
+            <label>📍 Откуда (широта, долгота или адрес)</label>
+            <input id="from" placeholder="48.7, 44.5 или адрес" />
+            <label>📍 Куда (широта, долгота или адрес)</label>
+            <input id="to" placeholder="48.7, 44.6 или адрес" />
+            <div class="row">
+                <button type="button" onclick="useClick('from')">📍 Откуда</button>
+                <button type="button" onclick="useClick('to')">📍 Куда</button>
+            </div>
+            <label>📍 Промежуточные точки (улицы/адреса, по одной в строке)</label>
+            <textarea id="waypoints" rows="3" placeholder="ул. Пример, 1&#10;ул. Вторая, 5"></textarea>
+        </div>
+
+        <!-- Операторский: точка или область полёта (квадрат/лассо) -->
+        <div id="orderFormOperator" class="order-form-block" style="display:none">
+            <label>Режим задания</label>
+            <div class="row" style="flex-wrap:wrap; gap:8px;">
+                <label style="margin:0; display:flex; align-items:center; gap:6px; cursor:pointer;">
+                    <input type="radio" name="operatorMode" value="point" checked /> Точка
+                </label>
+                <label style="margin:0; display:flex; align-items:center; gap:6px; cursor:pointer;">
+                    <input type="radio" name="operatorMode" value="area" /> Квадрат
+                </label>
+                <label style="margin:0; display:flex; align-items:center; gap:6px; cursor:pointer;">
+                    <input type="radio" name="operatorMode" value="lasso" /> Лассо
+                </label>
+            </div>
+            <div id="operatorPointBlock">
+                <label>📍 Точка назначения (широта, долгота или адрес)</label>
+                <input id="operatorPoint" placeholder="48.7, 44.6 или адрес" />
+                <button type="button" onclick="useClick('operatorPoint')">📍 Указать на карте</button>
+            </div>
+            <div id="operatorAreaBlock" style="display:none">
+                <p class="muted" style="margin-bottom:8px" id="operatorAreaHint">Нажмите «Выделить» и нарисуйте прямоугольник на карте (зажмите левую кнопку и тяните).</p>
+                <button type="button" id="btnDrawOperatorArea" onclick="toggleOperatorAreaDraw()">📐 Выделить область</button>
+                <div id="operatorAreaInfo" class="muted" style="margin-top:8px; font-size:12px;">Область не выбрана</div>
+            </div>
+        </div>
+
+        <!-- Сервисный: только финальная точка -->
+        <div id="orderFormService" class="order-form-block" style="display:none">
+            <label>📍 Финальная точка (широта, долгота или адрес)</label>
+            <input id="toService" placeholder="48.7, 44.6 или адрес" />
+            <button type="button" onclick="useClick('toService')">📍 Указать на карте</button>
+        </div>
+
+        <label>🗂️ Тип заказа</label>
+		<select id="type">
+            <option value="delivery">🚚 доставка</option>
+            <option value="shooting">📷 съёмка</option>
+            <option value="work">🔧 работа</option>
 		</select>
         <label>⚡ Приоритет (1–10, больше = выше в очереди)</label>
 		<select id="priority">
@@ -607,8 +651,6 @@
         </select>
         <label>🔋 Батарея %</label>
 		<input id="battery" type="number" min="1" max="100" value="100" />
-        <label>📍 Промежуточные точки (улицы/адреса, по одной в строке)</label>
-        <textarea id="waypoints" rows="3" placeholder="ул. Пример, 1&#10;ул. Вторая, 5"></textarea>
         <div class="row">
             <input id="batchCount" type="number" min="1" max="10" value="1" placeholder="Кол-во"/>
             <button onclick="submitOrder()">✅ Отправить</button>
@@ -669,9 +711,66 @@ let changeDestOrderId = null;
 let stationMarkers = [];
 let stations = [];
 let pushStationsTimer = null;
+let operatorAreaBounds = null;
+let operatorAreaPolygon = null;
+let operatorAreaDrawing = false;
+let operatorAreaMode = 'area';  // 'area' = rectangle, 'lasso' = polygon
+let tempOperatorRect = null;
+let tempOperatorPolygon = null;
+let operatorAreaStartLatLng = null;
 function pushStationsDebounced(){
     if (pushStationsTimer) clearTimeout(pushStationsTimer);
     pushStationsTimer = setTimeout(()=>{ pushStations(); }, 300);
+}
+
+function updateOrderFormByDroneType(){
+    const droneType = (document.getElementById('droneType').value || '').trim();
+    const cargoBlock = document.getElementById('orderFormCargo');
+    const operatorBlock = document.getElementById('orderFormOperator');
+    const serviceBlock = document.getElementById('orderFormService');
+    cargoBlock.style.display = (droneType === '' || droneType === 'cargo') ? 'block' : 'none';
+    operatorBlock.style.display = droneType === 'operator' ? 'block' : 'none';
+    serviceBlock.style.display = droneType === 'cleaner' ? 'block' : 'none';
+    if (droneType === 'operator'){
+        const mode = document.querySelector('input[name="operatorMode"]:checked');
+        const modeVal = mode ? mode.value : 'point';
+        const isPoint = modeVal === 'point';
+        operatorAreaMode = modeVal === 'lasso' ? 'lasso' : 'area';
+        document.getElementById('operatorPointBlock').style.display = isPoint ? 'block' : 'none';
+        document.getElementById('operatorAreaBlock').style.display = isPoint ? 'none' : 'block';
+        const hint = document.getElementById('operatorAreaHint');
+        if (hint) hint.textContent = operatorAreaMode === 'lasso'
+            ? 'Кликните на карте для добавления точек многоугольника. «Готово» — завершить.'
+            : 'Нажмите «Выделить» и нарисуйте прямоугольник (зажмите левую кнопку и тяните).';
+    }
+    if (droneType !== 'operator'){ operatorAreaDrawing = false; operatorAreaPolygon = null; tempOperatorRect && map.removeLayer(tempOperatorRect); tempOperatorRect = null; tempOperatorPolygon && map.removeLayer(tempOperatorPolygon); tempOperatorPolygon = null; }
+}
+
+function toggleOperatorAreaDraw(){
+    if (operatorAreaMode === 'lasso' && operatorAreaPolygon && operatorAreaPolygon.length >= 3){
+        operatorAreaDrawing = false;
+        const btn = document.getElementById('btnDrawOperatorArea');
+        if (btn) btn.textContent = '📐 Выделить область';
+        tempOperatorPolygon && map.removeLayer(tempOperatorPolygon);
+        tempOperatorPolygon = null;
+        const info = document.getElementById('operatorAreaInfo');
+        if (info) info.textContent = 'Лассо: ' + operatorAreaPolygon.length + ' точек';
+        return;
+    }
+    operatorAreaDrawing = !operatorAreaDrawing;
+    const btn = document.getElementById('btnDrawOperatorArea');
+    if (btn) btn.textContent = operatorAreaDrawing ? (operatorAreaMode === 'lasso' ? '✔ Готово' : '✔ Готово (нарисуйте на карте)') : '📐 Выделить область';
+    if (!operatorAreaDrawing){
+        tempOperatorRect && map.removeLayer(tempOperatorRect);
+        tempOperatorRect = null;
+        if (operatorAreaMode === 'lasso'){ operatorAreaPolygon = null; tempOperatorPolygon && map.removeLayer(tempOperatorPolygon); tempOperatorPolygon = null; }
+    } else if (operatorAreaMode === 'lasso'){
+        operatorAreaPolygon = [];
+        tempOperatorPolygon && map.removeLayer(tempOperatorPolygon);
+        tempOperatorPolygon = null;
+        const info = document.getElementById('operatorAreaInfo');
+        if (info) info.textContent = 'Кликните на карте для добавления точек...';
+    }
 }
 
 let ws;
@@ -846,30 +945,75 @@ function parseMaybeCoords(s){
 }
 
 async function submitOrder(){
-    const f = document.getElementById('from').value.trim();
-    const t = document.getElementById('to').value.trim();
     const type = document.getElementById('type').value;
     const droneTypeEl = document.getElementById('droneType');
     const droneType = droneTypeEl && droneTypeEl.value ? droneTypeEl.value.trim() : '';
     const priority = parseInt(document.getElementById('priority').value||'5', 10);
     const battery = parseFloat(document.getElementById('battery').value||'100');
     const batch = Math.max(1, Math.min(10, parseInt(document.getElementById('batchCount').value||'1')));
-    const waypointsText = (document.getElementById('waypoints').value||'').trim();
-    const wpCoords = [];
-    if (waypointsText){
-        for (const line of waypointsText.split(/\n+/)){
-            const s = line.trim(); if (!s) continue;
-            const pc = parseMaybeCoords(s);
-            if (pc) wpCoords.push(pc);
+
+    let bodyList = [];
+    if (droneType === 'cleaner'){
+        // Сервисный: только финальная точка
+        const t = (document.getElementById('toService').value||'').trim();
+        const tc = parseMaybeCoords(t);
+        for (let i=0;i<batch;i++){
+            const body = { type_hint: type, battery_level: battery, priority: priority, drone_type: 'cleaner' };
+            if (tc) body.coords_to = tc; else body.address_to = t;
+            bodyList.push(body);
+        }
+    } else if (droneType === 'operator'){
+        const mode = document.querySelector('input[name="operatorMode"]:checked');
+        const isPoint = !mode || mode.value === 'point';
+        if (isPoint){
+            const pt = (document.getElementById('operatorPoint').value||'').trim();
+            const ptc = parseMaybeCoords(pt);
+            for (let i=0;i<batch;i++){
+                const body = { type_hint: type, battery_level: battery, priority: priority, drone_type: 'operator' };
+                if (ptc) body.coords_to = ptc; else body.address_to = pt;
+                bodyList.push(body);
+            }
+        } else {
+            if (operatorAreaMode === 'lasso'){
+                if (!operatorAreaPolygon || operatorAreaPolygon.length < 3){ alert('Нарисуйте лассо: минимум 3 точки'); return; }
+                for (let i=0;i<batch;i++){
+                    const body = { type_hint: type, battery_level: battery, priority: priority, drone_type: 'operator', area_polygon: operatorAreaPolygon };
+                    bodyList.push(body);
+                }
+            } else {
+                if (!operatorAreaBounds){ alert('Выделите область на карте'); return; }
+                const sw = [operatorAreaBounds.lat_min, operatorAreaBounds.lon_min];
+                const ne = [operatorAreaBounds.lat_max, operatorAreaBounds.lon_max];
+                for (let i=0;i<batch;i++){
+                    const body = { type_hint: type, battery_level: battery, priority: priority, drone_type: 'operator', coords_from: sw, coords_to: ne };
+                    bodyList.push(body);
+                }
+            }
+        }
+    } else {
+        // Грузовой или по умолчанию
+        const f = document.getElementById('from').value.trim();
+        const t = document.getElementById('to').value.trim();
+        const waypointsText = (document.getElementById('waypoints').value||'').trim();
+        const wpCoords = [];
+        if (waypointsText){
+            for (const line of waypointsText.split(/\n+/)){
+                const s = line.trim(); if (!s) continue;
+                const pc = parseMaybeCoords(s);
+                if (pc) wpCoords.push(pc);
+            }
+        }
+        const fc = parseMaybeCoords(f); const tc = parseMaybeCoords(t);
+        for (let i=0;i<batch;i++){
+            const body = { type_hint: type, battery_level: battery, priority: priority };
+            if (droneType) body.drone_type = droneType;
+            if (fc) body.coords_from = fc; else body.address_from = f;
+            if (tc) body.coords_to = tc; else body.address_to = t;
+            if (wpCoords.length) body.waypoints = wpCoords;
+            bodyList.push(body);
         }
     }
-    for (let i=0;i<batch;i++){
-        const body = { type_hint: type, battery_level: battery, priority: priority };
-        if (droneType) body.drone_type = droneType;
-        const fc = parseMaybeCoords(f); const tc = parseMaybeCoords(t);
-        if (fc) body.coords_from = fc; else body.address_from = f;
-        if (tc) body.coords_to = tc; else body.address_to = t;
-        if (wpCoords.length) body.waypoints = wpCoords;
+    for (const body of bodyList){
         await fetch('/api/orders', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     }
 }
@@ -878,8 +1022,22 @@ function useClick(which){
     currentPick = which;
 }
 
-map.on('click', (e)=>{
+map.on('click', async (e)=>{
     const {lat, lng} = e.latlng;
+    // Лассо: клик добавляет точку многоугольника
+    if (operatorAreaDrawing && operatorAreaMode === 'lasso'){
+        operatorAreaPolygon = operatorAreaPolygon || [];
+        operatorAreaPolygon.push([lat, lng]);
+        if (tempOperatorPolygon) map.removeLayer(tempOperatorPolygon);
+        if (operatorAreaPolygon.length >= 2){
+            const closed = [...operatorAreaPolygon];
+            if (operatorAreaPolygon.length >= 3) closed.push(operatorAreaPolygon[0]);
+            tempOperatorPolygon = L.polygon(closed, {color:'#3b82f6', weight:2, dashArray:'4', fillOpacity:0.15}).addTo(map);
+        }
+        const info = document.getElementById('operatorAreaInfo');
+        if (info) info.textContent = 'Лассо: ' + operatorAreaPolygon.length + ' точек. «Готово» чтобы завершить.';
+        return;
+    }
     if (currentPick){
         const s = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
         if (currentPick==='base') document.getElementById('base').value = s; else document.getElementById(currentPick).value = s;
@@ -891,25 +1049,47 @@ map.on('click', (e)=>{
         changeDestOrderId = null;
         return;
     }
-    // Add station with Alt+Click
+    // Add station with Alt+Click (сохраняем сразу, иначе следующий WS через 0.25 с перезапишет stations)
     if (e.originalEvent.altKey){
         stations.push([lat, lng]);
         drawStations();
-        pushStationsDebounced();
+        await pushStations();
         return;
     }
 });
 
-// rectangle drawing with Shift+Drag
+// rectangle drawing: Shift+Drag = бесполётная зона; режим операторской области = прямоугольник (не лассо)
 let drawing = false; let startLatLng = null; let tempRect = null;
-map.on('mousedown', (e)=>{ if (!e.originalEvent.shiftKey) return; drawing = true; startLatLng = e.latlng; tempRect && map.removeLayer(tempRect); });
-map.on('mousemove', (e)=>{ if (!drawing) return; const bounds = L.latLngBounds(startLatLng, e.latlng); tempRect && map.removeLayer(tempRect); tempRect = L.rectangle(bounds, {color:'#EA4335', weight:1, dashArray:'4', fillOpacity:0.1}).addTo(map); });
+map.on('mousedown', (e)=>{
+    if (operatorAreaDrawing && operatorAreaMode === 'area'){ drawing = true; startLatLng = e.latlng; tempOperatorRect && map.removeLayer(tempOperatorRect); tempOperatorRect = null; return; }
+    if (!e.originalEvent.shiftKey) return;
+    drawing = true; startLatLng = e.latlng; tempRect && map.removeLayer(tempRect);
+});
+map.on('mousemove', (e)=>{
+    if (!drawing) return;
+    const bounds = L.latLngBounds(startLatLng, e.latlng);
+    if (operatorAreaDrawing && operatorAreaMode === 'area'){ tempOperatorRect && map.removeLayer(tempOperatorRect); tempOperatorRect = L.rectangle(bounds, {color:'#3b82f6', weight:2, dashArray:'4', fillOpacity:0.15}).addTo(map); return; }
+    tempRect && map.removeLayer(tempRect); tempRect = L.rectangle(bounds, {color:'#EA4335', weight:1, dashArray:'4', fillOpacity:0.1}).addTo(map);
+});
 map.on('mouseup', async (e)=>{
-	if (!drawing) return; drawing = false;
-	const bounds = L.latLngBounds(startLatLng, e.latlng);
-	const sw = bounds.getSouthWest(); const ne = bounds.getNorthEast();
-	await fetch('/api/no_fly_zones', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({lat_min: sw.lat, lon_min: sw.lng, lat_max: ne.lat, lon_max: ne.lng})});
-	if (tempRect) { map.removeLayer(tempRect); tempRect = null; }
+    if (!drawing) return;
+    const bounds = L.latLngBounds(startLatLng, e.latlng);
+    const sw = bounds.getSouthWest(); const ne = bounds.getNorthEast();
+    if (operatorAreaDrawing && operatorAreaMode === 'area'){
+        drawing = false;
+        operatorAreaBounds = { lat_min: sw.lat, lon_min: sw.lng, lat_max: ne.lat, lon_max: ne.lng };
+        operatorAreaPolygon = null;
+        tempOperatorRect && map.removeLayer(tempOperatorRect); tempOperatorRect = null;
+        operatorAreaDrawing = false;
+        const btn = document.getElementById('btnDrawOperatorArea');
+        if (btn) btn.textContent = '📐 Выделить область';
+        const info = document.getElementById('operatorAreaInfo');
+        if (info) info.textContent = `Квадрат: ${sw.lat.toFixed(5)}, ${sw.lng.toFixed(5)} — ${ne.lat.toFixed(5)}, ${ne.lng.toFixed(5)}`;
+        return;
+    }
+    drawing = false;
+    await fetch('/api/no_fly_zones', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({lat_min: sw.lat, lon_min: sw.lng, lat_max: ne.lat, lon_max: ne.lng})});
+    if (tempRect) { map.removeLayer(tempRect); tempRect = null; }
 });
 
 async function clearZones(){
@@ -927,12 +1107,12 @@ function nearestStationIndex(lat, lng){
     return bi;
 }
 
-map.on('contextmenu', (e)=>{
+map.on('contextmenu', async (e)=>{
     // Ctrl + right-click to remove nearest station
     if (!e.originalEvent.ctrlKey) return;
     const {lat, lng} = e.latlng;
     const idx = nearestStationIndex(lat, lng);
-    if (idx >= 0){ stations.splice(idx, 1); drawStations(); pushStationsDebounced(); }
+    if (idx >= 0){ stations.splice(idx, 1); drawStations(); await pushStations(); }
 });
 
 async function pushStations(){
@@ -975,6 +1155,9 @@ themeToggle.addEventListener('change', ()=>{
     document.documentElement.classList.toggle('theme-dark', themeToggle.checked);
 });
 
+document.getElementById('droneType').addEventListener('change', updateOrderFormByDroneType);
+document.querySelectorAll('input[name="operatorMode"]').forEach(el=> el.addEventListener('change', updateOrderFormByDroneType));
+
 function ruStatus(s){
     return ({
         'idle':'свободен', 'enroute':'в пути', 'avoidance':'обход препятствия', 'holding':'ожидание', 'low_battery':'низкий заряд',
@@ -983,7 +1166,7 @@ function ruStatus(s){
     })[s]||s;
 }
 function droneTypeRu(t){
-    return ({ 'cargo':'грузовой', 'operator':'операторский', 'cleaner':'мойщик' })[t]||t||'—';
+    return ({ 'cargo':'грузовой', 'operator':'операторский', 'cleaner':'сервисный' })[t]||t||'—';
 }
 
 function focusDrone(id){
@@ -1019,7 +1202,7 @@ async function saveBase(){
 }
 
 // Автозагрузка города при старте (для удобства)
-window.addEventListener('load', ()=>{ loadCity(); });
+window.addEventListener('load', ()=>{ loadCity(); updateOrderFormByDroneType(); });
 // Load base, stations and weather on startup to populate UI quickly
 window.addEventListener('load', async ()=>{
     try{

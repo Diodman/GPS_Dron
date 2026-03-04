@@ -418,9 +418,9 @@ class RoutingService:
                     continue
             
             if nearest_node:
-                # Преобразуем расстояние в метры для логирования
+                # Преобразуем расстояние в метры для логирования (debug — при многих станциях не спамим)
                 distance_meters = min_dist * 111000  # приблизительно
-                self.logger.info(f"Найден ближайший узел {nearest_node} на расстоянии {distance_meters:.1f}м от {point}")
+                self.logger.debug(f"Найден ближайший узел {nearest_node} на расстоянии {distance_meters:.1f}м от {point}")
             else:
                 self.logger.error(f"Не удалось найти ближайший узел для точки {point}")
             
