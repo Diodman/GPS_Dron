@@ -6,6 +6,7 @@ import pickle
 import requests
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
+from geopy.exc import GeocoderServiceError, GeocoderTimedOut
 import logging
 import json
 from redis import Redis
@@ -20,16 +21,17 @@ class DataService:
             'nominatim': Nominatim(user_agent="drone_route_planner", timeout=10),
             'nominatim_ru': Nominatim(user_agent="drone_route_planner", timeout=10, domain='nominatim.openstreetmap.org')
         }
-        # Rate-limited reverse geocoder
-        self._reverse = RateLimiter(self.geolocators['nominatim'].reverse, min_delay_seconds=1)
+        # Rate-limited reverse geocoder (Nominatim: 1 req/s; 509 = Bandwidth Limit Exceeded)
+        self._reverse = RateLimiter(self.geolocators['nominatim'].reverse, min_delay_seconds=2)
+        self._reverse_cache: dict[tuple, str | None] = {}  # (lat_round, lon_round) -> address or None
         
         # Настройка логирования
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
-        # optional Redis for caching heavy city data
+        # optional Redis for caching heavy city data (короткий таймаут — без Redis старт не зависает)
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
         try:
-            self._redis: Redis | None = Redis.from_url(redis_url)
+            self._redis: Redis | None = Redis.from_url(redis_url, socket_connect_timeout=1.5)
             # do not decode responses here; we store bytes for pickle blobs
             self._redis.ping()
         except Exception:
@@ -196,17 +198,28 @@ class DataService:
         return None
 
     def coords_to_address(self, coords: tuple, language: str = 'ru'):
-        """Обратное геокодирование координат в строку улицы/адреса."""
+        """Обратное геокодирование координат в строку улицы/адреса. Кэш по округлённым координатам, обработка 509."""
+        if not coords or len(coords) != 2:
+            return None
+        lat, lon = coords
+        cache_key = (round(lat, 5), round(lon, 5))
+        if cache_key in self._reverse_cache:
+            return self._reverse_cache[cache_key]
         try:
-            if not coords or len(coords) != 2:
-                return None
-            lat, lon = coords
             location = self._reverse((lat, lon), language=language, timeout=10)
             if location and location.address:
+                self._reverse_cache[cache_key] = location.address
                 return location.address
+            self._reverse_cache[cache_key] = None
+            return None
+        except (GeocoderServiceError, GeocoderTimedOut) as e:
+            # 509 Bandwidth Limit Exceeded или таймаут — не спамим лог, возвращаем None
+            self.logger.warning(f"Геокодер недоступен (лимит/таймаут): {type(e).__name__}")
+            self._reverse_cache[cache_key] = None
             return None
         except Exception as e:
             self.logger.warning(f"Ошибка обратного геокодирования {coords}: {e}")
+            self._reverse_cache[cache_key] = None
             return None
     
     def _validate_coords_in_city(self, coords, city_name):
@@ -239,7 +252,7 @@ class DataService:
         try:
             with open(cache_file, 'rb') as f:
                 return pickle.load(f)
-        except:
+        except Exception:
             if os.path.exists(cache_file):
                 os.remove(cache_file)
             raise

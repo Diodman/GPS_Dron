@@ -8,8 +8,8 @@ from typing import Dict, List, Optional, Tuple, Any
 MODE_EMPTY = "empty"
 MODE_LOADED = "loaded"
 
-# Default reserve and charger arrival thresholds (can be overridden in drone params)
-DEFAULT_RESERVE_PCT = 10.0
+# Default reserve and charger arrival thresholds (80% usable / 20% reserve)
+DEFAULT_RESERVE_PCT = 20.0
 DEFAULT_CHARGER_ARRIVAL_MIN_PCT = 5.0
 
 
@@ -204,6 +204,24 @@ class RoutingService:
 
             path = full_path
 
+            if not path:
+                # Cleanup before return
+                try:
+                    if tmp_start in G:
+                        G.remove_node(tmp_start)
+                    if tmp_end in G:
+                        G.remove_node(tmp_end)
+                    for n in temp_nodes:
+                        if n in G:
+                            G.remove_node(n)
+                except Exception:
+                    pass
+                return None, None, 0.0
+
+            # Build coords and length while temp nodes are still in G
+            coords = [G.nodes[n]['pos'] for n in path]
+            length = self._calculate_path_length(G, path)
+
             # Cleanup temp nodes/edges
             try:
                 if tmp_start in G:
@@ -216,10 +234,6 @@ class RoutingService:
             except Exception:
                 pass
 
-            if not path:
-                return None, None, 0.0
-            coords = [G.nodes[n]['pos'] if n in G.nodes else (start_coords if n == tmp_start else end_coords) for n in path]
-            length = self._calculate_path_length(G, path)
             return path, coords, length
         except Exception as e:
             self.logger.error(f"Ошибка door-to-door планирования: {e}")
@@ -280,15 +294,23 @@ class RoutingService:
                 except Exception as e:
                     self.logger.debug(f"Алгоритм {algo_name} не сработал: {e}")
                     continue
-            
-            # Если не нашли подходящий путь, но есть слишком длинный
-            if best_path and best_length < max_range * 2:  # Если путь не слишком длинный
-                self.logger.warning(f"Найден слишком длинный путь: {best_length:.1f}м > {max_range:.1f}м")
-                return best_path
-            
-            self.logger.warning(f"Не удалось найти подходящий путь между {start} и {end}")
-            return None
-            
+
+            # Если лучший найденный путь длиннее max_range — считаем, что на одном заряде сегмент недостижим
+            # (пусть вышестоящий код попробует строить маршрут через станции зарядки).
+            if best_path and best_length > max_range:
+                self.logger.debug(
+                    "Лучший путь %.1fм превышает лимит %.1fм — считаем сегмент недостижимым на одном заряде",
+                    best_length, max_range,
+                )
+                best_path = None
+
+            if not best_path:
+                self.logger.warning(f"Не удалось найти подходящий путь между {start} и {end}")
+                return None
+
+            # best_path есть и укладывается в max_range
+            return best_path
+
         except Exception as e:
             self.logger.error(f"Ошибка поиска пути: {e}")
             return None
@@ -418,9 +440,9 @@ class RoutingService:
                     continue
             
             if nearest_node:
-                # Преобразуем расстояние в метры для логирования
+                # Преобразуем расстояние в метры для логирования (debug — при многих станциях не спамим)
                 distance_meters = min_dist * 111000  # приблизительно
-                self.logger.info(f"Найден ближайший узел {nearest_node} на расстоянии {distance_meters:.1f}м от {point}")
+                self.logger.debug(f"Найден ближайший узел {nearest_node} на расстоянии {distance_meters:.1f}м от {point}")
             else:
                 self.logger.error(f"Не удалось найти ближайший узел для точки {point}")
             
@@ -715,8 +737,14 @@ class RoutingService:
         try:
             path_names = nx.shortest_path(H, "start", "goal", weight="weight")
         except (nx.NetworkXNoPath, nx.NodeNotFound):
+            self.logger.debug("plan_with_chargers: no path start->goal in meta-graph (battery=%.1f%%, mode=%s)", battery_pct, mode)
             return None, None, 0.0, []
 
+        if len(path_names) > 2:
+            self.logger.info(
+                "plan_with_chargers: route via chargers: %s (battery=%.1f%%)",
+                " -> ".join(path_names), battery_pct,
+            )
         full_path = []
         full_coords = []
         total_length = 0.0
@@ -742,7 +770,8 @@ class RoutingService:
             # When leaving a charger, battery is 100%
             if a in charger_names:
                 battery = 100.0
-            drain = (seg_len / m_per_pct) * 100.0
+            # Единая формула: m_per_pct = метров на 1% заряда → расход в % = distance_m / m_per_pct (без *100)
+            drain = seg_len / m_per_pct
             battery_after = max(0.0, battery - drain)
             if battery_after < 0:
                 return None, None, 0.0, []

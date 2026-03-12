@@ -85,9 +85,9 @@ def test_battery_params_single_source(routing: RoutingService):
 
 def test_compute_battery_after(routing: RoutingService):
     """compute_battery_after: empty mode uses more m per % than loaded (less drain per km when empty)."""
-    # Empty: 200 m per 1% for cargo -> 1000m = 5% drain
+    # Empty: cargo empty_m_per_pct=120 -> 1000m ≈ 8.33% drain, ~91.67% left
     b_after = routing.compute_battery_after(1000.0, 100.0, MODE_EMPTY, "cargo")
-    assert 94.0 <= b_after <= 96.0
+    assert 90.0 <= b_after <= 93.0
     b_after_loaded = routing.compute_battery_after(1000.0, 100.0, MODE_LOADED, "cargo")
     assert b_after_loaded < b_after  # loaded drains more
 
