@@ -252,7 +252,7 @@ class DataService:
         try:
             with open(cache_file, 'rb') as f:
                 return pickle.load(f)
-        except:
+        except Exception:
             if os.path.exists(cache_file):
                 os.remove(cache_file)
             raise

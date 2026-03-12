@@ -89,10 +89,15 @@ class GraphService:
                     # Вычисляем длину ребра
                     length = data.get('length', 0)
                     if length == 0:
-                        # Вычисляем расстояние между узлами если длина не указана
+                        # Вычисляем расстояние между узлами если длина не указана (метры: широта и долгота с cos(lat))
                         pos1 = G.nodes[u]['pos']
                         pos2 = G.nodes[v]['pos']
-                        length = np.sqrt((pos1[0]-pos2[0])**2 + (pos1[1]-pos2[1])**2) * 111000  # приблизительно в метрах
+                        lat1, lon1 = pos1[0], pos1[1]
+                        lat2, lon2 = pos2[0], pos2[1]
+                        lat_m = (lat2 - lat1) * 111000.0
+                        avg_lat = (lat1 + lat2) / 2.0
+                        lon_m = (lon2 - lon1) * 111000.0 * max(0.01, np.cos(np.radians(avg_lat)))
+                        length = float(np.sqrt(lat_m**2 + lon_m**2))
                     
                     G.add_edge(u, v, 
                              weight=length, 

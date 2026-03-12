@@ -661,6 +661,7 @@
         <button onclick="clearZones()">🗑️ Очистить зоны</button>
 		<hr />
         <h4>⚡ Станции зарядки</h4>
+        <div id="stationBatteryCounts" class="muted" style="margin-bottom:8px;">—</div>
         <p class="muted">Alt + зажатая левая кнопка — добавить станцию. Ctrl + клик — удалить ближайшую.</p>
         <div class="row">
             <button onclick="pushStations()">💾 Сохранить</button>
@@ -784,9 +785,11 @@ ws.onmessage = ev => {
     window.lastHistories = s.histories || {};
     updateDrones(s.drones||{});
     drawZones(s.no_fly_zones||[]);
-    // update stations from server truth
+    // update stations from server truth and состояние аккумуляторов
     stations = s.stations || [];
+    window.stationStates = s.station_states || [];
     drawStations();
+    updateStationCountsUI();
     // populate base input if empty and server sends base
     if (s.base && (!document.getElementById('base').value || document.getElementById('base').value.trim()==='')){
         const [lat, lon] = s.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
@@ -925,10 +928,30 @@ function drawZones(zones){
 function drawStations(){
     stationMarkers.forEach(m=> map.removeLayer(m));
     stationMarkers = [];
-    stations.forEach(s=>{
-        const m = L.circleMarker(s, {radius:6, color:'#34A853', weight:2, fillColor:'#34A853', fillOpacity:0.6}).addTo(map).bindTooltip('⚡ Станция зарядки');
+    const states = window.stationStates || [];
+    stations.forEach((s, i)=>{
+        const st = states[i];
+        const charged = st && st.charged != null ? st.charged : 20;
+        const charging = st && st.charging != null ? st.charging : 0;
+        const tip = `⚡ Станция зарядки • Заряжено: ${charged}/20${charging ? `, в зарядке: ${charging}` : ''}`;
+        const m = L.circleMarker(s, {radius:6, color:'#34A853', weight:2, fillColor:'#34A853', fillOpacity:0.6}).addTo(map).bindTooltip(tip);
         stationMarkers.push(m);
     });
+}
+
+function updateStationCountsUI(){
+    const el = document.getElementById('stationBatteryCounts');
+    if (!el) return;
+    const states = window.stationStates || [];
+    if (states.length === 0) {
+        el.innerHTML = '<span class="muted">Нет станций или данные не загружены</span>';
+        return;
+    }
+    el.innerHTML = states.map((st, i) => {
+        const charged = st && st.charged != null ? st.charged : 20;
+        const charging = st && st.charging != null ? st.charging : 0;
+        return `<div class="muted">Станция ${i + 1}: <b>${charged}</b> заряжено / 20${charging ? `, в зарядке: ${charging}` : ''}</div>`;
+    }).join('');
 }
 
 async function loadCity(){
@@ -1218,6 +1241,7 @@ window.addEventListener('load', async ()=>{
     try{
         const s = await fetch('/api/state').then(x=>x.json());
         if (s.weather) updateWeatherUI(s.weather);
+        if (s.station_states) { window.stationStates = s.station_states; updateStationCountsUI(); }
     }catch(e){}
 });
 </script>
