@@ -43,6 +43,8 @@ STATION_CHARGED_BATTERIES_MAX = 20
 STATION_BATTERY_CHARGE_TICKS = 25
 # Оценка: тиков на одну остановку на зарядку (база: 4% за тик, с 20% до 100% ≈ 20 тиков). 1 тик ≈ 1 сек.
 CHARGE_TICKS_ESTIMATE_PER_STOP = 20
+# Порог завершения зарядки: избегаем зависаний на 99.x% из-за плавающей точности.
+CHARGE_COMPLETE_PCT = 99.0
 # Скорость по умолчанию для оценки ETA (м/с), если ветер неизвестен
 DEFAULT_SPEED_MPS = 12.0
 
@@ -647,8 +649,8 @@ def _point_in_polygon(point: Tuple[float, float], polygon: List[Tuple[float, flo
 	return inside
 
 
-# Шаг сетки облёта внутри зоны (м). Меньше = плотнее маршрут.
-OPERATOR_AREA_GRID_STEP_M = 80.0
+# Базовый шаг сетки облёта внутри зоны (м). Для городского осмотра держим плотнее.
+OPERATOR_AREA_GRID_STEP_M = 30.0
 
 
 def _lawnmower_waypoints_inside_polygon(polygon: List[Tuple[float, float]], step_m: float = OPERATOR_AREA_GRID_STEP_M) -> List[Tuple[float, float]]:
@@ -693,6 +695,25 @@ def _lawnmower_waypoints_inside_polygon(polygon: List[Tuple[float, float]], step
 	return out
 
 
+def _polygon_bbox_dims_m(polygon: List[Tuple[float, float]]) -> Tuple[float, float]:
+	if not polygon:
+		return (0.0, 0.0)
+	lats = [p[0] for p in polygon]
+	lons = [p[1] for p in polygon]
+	lat_mid = (min(lats) + max(lats)) / 2.0
+	h_m = abs(max(lats) - min(lats)) * 111_000.0
+	w_m = abs(max(lons) - min(lons)) * 111_000.0 * max(0.01, math.cos(math.radians(lat_mid)))
+	return (w_m, h_m)
+
+
+def _operator_area_grid_step_m(polygon: List[Tuple[float, float]]) -> float:
+	"""Адаптивный шаг змейки: целимся в 20..40 м в зависимости от размера зоны."""
+	w_m, h_m = _polygon_bbox_dims_m(polygon)
+	min_dim = max(1.0, min(w_m, h_m))
+	adaptive = min_dim / 8.0
+	return float(max(20.0, min(40.0, adaptive)))
+
+
 def _operator_area_waypoints(order: Dict[str, Any]) -> List[Tuple[float, float]]:
 	"""Точки облёта области: облёт внутри выделенной зоны (сетка лаунмower), не только контур."""
 	# Для continuation-задач используем уже оставшиеся внутренние точки,
@@ -717,7 +738,8 @@ def _operator_area_waypoints(order: Dict[str, Any]) -> List[Tuple[float, float]]
 		lon_min, lon_max = min(s[1], e[1]), max(s[1], e[1])
 		polygon = [(lat_min, lon_min), (lat_max, lon_min), (lat_max, lon_max), (lat_min, lon_max)]
 	if len(polygon) >= 3:
-		wp = _lawnmower_waypoints_inside_polygon(polygon, OPERATOR_AREA_GRID_STEP_M)
+		step_m = _operator_area_grid_step_m(polygon)
+		wp = _lawnmower_waypoints_inside_polygon(polygon, step_m)
 	if not wp:
 		# Fallback: только вершины контура (как раньше)
 		wp = list(polygon) if polygon else []
@@ -788,6 +810,73 @@ def _split_operator_area_by_battery(start_pos: Tuple[float, float], battery_pct:
 	return (current, [], bat)
 
 
+def _build_operator_area_route(
+	drone_pos: Tuple[float, float],
+	battery_pct: float,
+	polygon: List[Tuple[float, float]],
+	coverage_waypoints: List[Tuple[float, float]],
+	drone_type: str = "operator",
+) -> Dict[str, Any]:
+	"""
+	Смешанный маршрут operator-area:
+	A) approach по graph до входа в зону,
+	B) coverage free-flight внутри полигона,
+	C) exit по graph до зарядки.
+	"""
+	if not coverage_waypoints:
+		return {"ok": False, "reason": "NO_PATH", "details": "empty coverage"}
+	area_path = _build_operator_area_flight_path(drone_pos, polygon, coverage_waypoints)
+	if not area_path:
+		return {"ok": False, "reason": "NO_PATH", "details": "no valid coverage path"}
+
+	entry = tuple(area_path[0])
+	_, approach_coords_raw, approach_len = plan_route_for(tuple(drone_pos), entry, drone_type, battery_pct, reserve_pct=PLAN_RESERVE_PCT)
+	approach_coords = _to_coord_list(approach_coords_raw or [tuple(drone_pos)])
+	if not approach_coords:
+		approach_coords = [tuple(drone_pos)]
+	approach_last = tuple(approach_coords[-1])
+	approach_bat = _routing_service.compute_battery_after(approach_len, battery_pct, MODE_EMPTY, drone_type)
+
+	current_cov, remaining_cov, bat_after_cov = _split_operator_area_by_battery(approach_last, approach_bat, area_path)
+	if not current_cov:
+		return {
+			"ok": True,
+			"approach_coords": approach_coords,
+			"coverage_coords": [],
+			"exit_coords": [],
+			"combined_coords": approach_coords,
+			"approach_length": float(approach_len),
+			"coverage_length": 0.0,
+			"exit_length": 0.0,
+			"remaining_waypoints": area_path,
+			"handover_point": approach_last,
+			"coverage_start_idx": len(approach_coords),
+			"coverage_end_idx": len(approach_coords),
+		}
+
+	coverage_len = _route_length([approach_last] + current_cov)
+	last_cov = tuple(current_cov[-1])
+	exit_coords, exit_len = _best_escape_graph_path(last_cov, bat_after_cov, drone_type)
+	combined = _concat_coords(approach_coords, current_cov)
+	combined = _concat_coords(combined, exit_coords)
+	coverage_start_idx = max(0, len(approach_coords) - 1)
+	coverage_end_idx = coverage_start_idx + len(current_cov)
+	return {
+		"ok": True,
+		"approach_coords": approach_coords,
+		"coverage_coords": current_cov,
+		"exit_coords": exit_coords,
+		"combined_coords": combined,
+		"approach_length": float(approach_len),
+		"coverage_length": float(coverage_len),
+		"exit_length": float(exit_len),
+		"remaining_waypoints": remaining_cov,
+		"handover_point": last_cov,
+		"coverage_start_idx": coverage_start_idx,
+		"coverage_end_idx": coverage_end_idx,
+	}
+
+
 def _advance_area_order_progress(order: Dict[str, Any], flown_points: List[Tuple[float, float]]) -> None:
 	"""Обновляет прогресс area-миссии: completed/remaining для текущего заказа."""
 	remaining = [tuple(w) for w in (order.get("remaining_waypoints") or _operator_area_waypoints(order))]
@@ -798,11 +887,161 @@ def _advance_area_order_progress(order: Dict[str, Any], flown_points: List[Tuple
 	order["remaining_waypoints"] = [tuple(w) for w in remaining[n:]]
 
 
+def _to_coord_list(coords: List[Any]) -> List[Tuple[float, float]]:
+	out: List[Tuple[float, float]] = []
+	for p in coords or []:
+		if isinstance(p, (list, tuple)) and len(p) == 2:
+			out.append((float(p[0]), float(p[1])))
+	return out
+
+
+def _best_escape_graph_path(start: Tuple[float, float], battery_pct: float, drone_type: str = "operator") -> Tuple[List[Tuple[float, float]], float]:
+	"""Графовый выход до ближайшей зарядки: base/station."""
+	chargers: List[Tuple[float, float]] = []
+	if STATE.get("base"):
+		chargers.append(tuple(STATE["base"]))
+	chargers += [tuple(s) for s in STATE.get("stations", []) if isinstance(s, (list, tuple)) and len(s) == 2]
+	best_coords: List[Tuple[float, float]] = []
+	best_len = float("inf")
+	for c in chargers:
+		_, coords, length = plan_route_for(tuple(start), tuple(c), drone_type, battery_pct, reserve_pct=PLAN_RESERVE_PCT)
+		if coords and length < best_len:
+			best_len = float(length)
+			best_coords = _to_coord_list(coords)
+	if best_coords:
+		return (best_coords, best_len)
+	return ([], 0.0)
+
+
+def _concat_coords(a: List[Tuple[float, float]], b: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+	if not a:
+		return list(b or [])
+	if not b:
+		return list(a or [])
+	if a[-1] == b[0]:
+		return list(a) + list(b[1:])
+	return list(a) + list(b)
+
+
+def _get_active_order_for_drone(drone_id: str) -> Optional[Dict[str, Any]]:
+	for o in STATE.get("orders", []):
+		if o.get("drone_id") == drone_id and o.get("status") in ("assigned", "in_progress", "waiting_continuation"):
+			return o
+	return None
+
+
+def _remove_drone_from_charge_queues(drone_id: str) -> None:
+	"""Гарантированно убирает drone_id из всех списков очередей зарядки (база и станции)."""
+	bq = STATE.setdefault("base_queue", {"charging": [], "queue": [], "capacity": 2})
+	for key in ("charging", "queue"):
+		lst = bq.get(key) or []
+		while drone_id in lst:
+			lst.remove(drone_id)
+	STATE["base_queue"] = bq
+	sqs = STATE.setdefault("station_queues", {})
+	for _key, sq in list(sqs.items()):
+		for key2 in ("charging", "queue"):
+			lst = sq.get(key2) or []
+		while drone_id in lst:
+			lst.remove(drone_id)
+
+
+def _try_close_order_if_no_flight_after_charge(drone_id: str, drone: Dict[str, Any]) -> bool:
+	"""
+	После зарядки replan мог не построить маршрут; для operator area без оставшихся точек
+	закрываем заказ, чтобы не зависать in_progress.
+	"""
+	order = _get_active_order_for_drone(drone_id)
+	if not order:
+		return False
+	required_type = order.get("drone_type") or map_order_to_drone_type(order.get("type", "delivery"))
+	if required_type != "operator" or not order.get("area_polygon"):
+		return False
+	if order.get("remaining_waypoints"):
+		return False
+	oid = order.get("id")
+	# Order завершается после зарядки / передаётся в continuation — см. mark_order_completed_if_any.
+	mark_order_completed_if_any(drone_id)
+	o2 = _get_active_order_for_drone(drone_id)
+	return o2 is None or o2.get("id") != oid
+
+
+def _force_exit_charging_if_complete(drone_id: str, drone: Dict[str, Any]) -> None:
+	"""
+	Исправление инконсистентности: battery >= CHARGE_COMPLETE_PCT, status == charging.
+	Дрон выходит из charging, покидает очереди; далее resume миссии или idle + завершение заказа.
+	"""
+	if drone.get("status") != "charging":
+		return
+	if float(drone.get("battery", 0.0)) < CHARGE_COMPLETE_PCT:
+		return
+	_remove_drone_from_charge_queues(drone_id)
+	drone["battery"] = 100.0
+	_resume_after_charge_or_hold(drone_id, drone)
+	if drone.get("status") == "charging":
+		rt = drone.get("route") or []
+		ti = int(drone.get("target_idx", 0))
+		if rt and ti < len(rt):
+			drone["status"] = "enroute"
+		else:
+			mark_order_completed_if_any(drone_id)
+			drone["status"] = "idle"
+
+
+def _mark_order_in_progress_if_started(drone_id: str, drone: Dict[str, Any]) -> None:
+	"""Переводим заказ в in_progress, когда дрон реально движется по маршруту миссии."""
+	order = _get_active_order_for_drone(drone_id)
+	if not order:
+		return
+	route = drone.get("route") or []
+	if not route:
+		return
+	if int(drone.get("target_idx", 0)) >= len(route):
+		return
+	if drone.get("status") in ("enroute", "return_charge", "return_base"):
+		if order.get("status") == "assigned":
+			order["status"] = "in_progress"
+
+
+def _sanitize_active_drone_state(drone_id: str, drone: Dict[str, Any]) -> None:
+	"""
+	Инвариант state-machine:
+	если есть active_order и непустой route, дрон не должен оставаться idle/holding.
+	"""
+	order = _get_active_order_for_drone(drone_id)
+	route = drone.get("route") or []
+	idx = int(drone.get("target_idx", 0))
+	if order and route and idx < len(route) and drone.get("status") in ("idle", "holding"):
+		drone["status"] = "enroute"
+	# Дрон в holding без маршрута после неудачного replan — пробуем восстановить миссию или закрыть заказ.
+	if drone.get("status") == "holding" and order and (not route or idx >= len(route)):
+		if _restore_route_after_charging(drone):
+			pass
+		elif _try_close_order_if_no_flight_after_charge(drone_id, drone):
+			pass
+	# Защита: battery >= порога завершения зарядки, но статус всё ещё charging — выходим из зависшего состояния.
+	_force_exit_charging_if_complete(drone_id, drone)
+
+
+def _find_existing_continuation(parent_order: Dict[str, Any], remaining_waypoints: List[Tuple[float, float]]) -> Optional[Dict[str, Any]]:
+	"""Защита от дублей continuation: ищем уже существующий order с тем же mission/остатком."""
+	mission_id = str(parent_order.get("mission_id") or _operator_area_root_order_id(parent_order))
+	fingerprint = f"{mission_id}:{len(remaining_waypoints)}:{tuple(remaining_waypoints[:1] or [])}:{tuple(remaining_waypoints[-1:] or [])}"
+	for o in STATE.get("orders", []):
+		if o.get("status") not in ("queued", "assigned", "in_progress", "waiting_continuation"):
+			continue
+		if str(o.get("continuation_fingerprint") or "") == fingerprint:
+			return o
+	return None
+
+
 def _new_operator_area_continuation(order: Dict[str, Any], handover_point: Tuple[float, float], remaining_waypoints: List[Tuple[float, float]]) -> Dict[str, Any]:
 	root_id = _operator_area_root_order_id(order)
 	history = list(order.get("handover_history") or [])
 	history.append(tuple(handover_point))
 	cont_idx = int(order.get("continuation_index", 0)) + 1
+	mission_id = str(order.get("mission_id") or root_id)
+	fingerprint = f"{mission_id}:{len(remaining_waypoints)}:{tuple(remaining_waypoints[:1] or [])}:{tuple(remaining_waypoints[-1:] or [])}"
 	return {
 		"id": f"ord_cont_{root_id}_{cont_idx}_{len(STATE.get('orders', []))}",
 		"type": order.get("type", "shooting"),
@@ -822,6 +1061,10 @@ def _new_operator_area_continuation(order: Dict[str, Any], handover_point: Tuple
 		"continuation_index": cont_idx,
 		"is_area_continuation": True,
 		"parent_order_id": order.get("id"),
+		"continuation_of": order.get("id"),
+		"mission_id": mission_id,
+		"continuation_fingerprint": fingerprint,
+		"continuation_spawned": False,
 	}
 
 
@@ -844,45 +1087,57 @@ def plan_operator_area_trip(
 	pos = tuple(drone.get("pos", order.get("start", (0, 0))))
 	polygon = [tuple(p) for p in (order.get("area_polygon") or []) if isinstance(p, (list, tuple)) and len(p) == 2]
 	continuation_order = None
-	full_area_path = _build_operator_area_flight_path(pos, polygon, waypoints)
-	if not full_area_path:
-		return ({"ok": False, "reason": "NO_PATH", "details": "no path to area"}, None)
-	current_part, remaining_part, battery_after = _split_operator_area_by_battery(pos, battery_pct, full_area_path)
-	if not current_part:
-		# Даже первый безопасный сегмент недоступен — оставляем continuation от текущей точки.
-		continuation_order = _new_operator_area_continuation(order, pos, full_area_path)
+	route_info = _build_operator_area_route(pos, battery_pct, polygon, waypoints, "operator")
+	if not route_info.get("ok"):
+		return ({"ok": False, "reason": route_info.get("reason", "NO_PATH"), "details": route_info.get("details", "area route failed")}, None)
+	coverage_coords = _to_coord_list(route_info.get("coverage_coords") or [])
+	remaining_part = _to_coord_list(route_info.get("remaining_waypoints") or [])
+	if not coverage_coords and remaining_part:
+		# Даже coverage не начат: оставляем continuation в ожидании другого оператора.
+		existing = _find_existing_continuation(order, remaining_part)
+		continuation_order = existing or _new_operator_area_continuation(order, tuple(route_info.get("handover_point") or pos), remaining_part)
 		return ({
 			"ok": True,
-			"coords": [],
-			"route_length": 0.0,
+			"coords": _to_coord_list(route_info.get("approach_coords") or [pos]),
+			"route_length": float(route_info.get("approach_length", 0.0)),
 			"pickup_waypoint_count": 0,
 			"area_completed_waypoints_count": 0,
-			"area_total_waypoints_count": len(full_area_path),
+			"area_total_waypoints_count": len(_to_coord_list(_build_operator_area_flight_path(pos, polygon, waypoints))),
 			"chargers_used": [],
-			"battery_plan": [],
-			"segments": [{"type": "area", "coords": [], "length": 0.0, "chargers": []}],
+			"battery_plan": [{"at": "start", "battery": battery_pct}],
+			"segments": [{"type": "approach_graph", "coords": _to_coord_list(route_info.get("approach_coords") or []), "length": float(route_info.get("approach_length", 0.0)), "chargers": []}],
 			"mission_mode": "operator_area",
 			"force_charge_after_route": True,
+			"coverage_start_idx": int(route_info.get("coverage_start_idx", 0)),
+			"coverage_end_idx": int(route_info.get("coverage_end_idx", 0)),
 		}, continuation_order)
 
-	length = _route_length([pos] + current_part)
-	coords = list(current_part)
+	coords = _to_coord_list(route_info.get("combined_coords") or [])
+	length = float(route_info.get("approach_length", 0.0)) + float(route_info.get("coverage_length", 0.0)) + float(route_info.get("exit_length", 0.0))
 	if remaining_part:
 		# Передача operator area-задачи: фиксируем handover и оставшиеся внутренние точки.
-		handover = tuple(current_part[-1])
-		continuation_order = _new_operator_area_continuation(order, handover, remaining_part)
+		handover = tuple(route_info.get("handover_point") or coverage_coords[-1])
+		existing = _find_existing_continuation(order, remaining_part)
+		continuation_order = existing or _new_operator_area_continuation(order, handover, remaining_part)
 	result = {
 		"ok": True,
 		"coords": coords,
 		"route_length": length,
 		"pickup_waypoint_count": len(coords),
-		"area_completed_waypoints_count": len(current_part),
-		"area_total_waypoints_count": len(full_area_path),
+		"area_completed_waypoints_count": len(coverage_coords),
+		"area_total_waypoints_count": len(coverage_coords) + len(remaining_part),
 		"chargers_used": [],
-		"battery_plan": [{"at": "start", "battery": battery_pct}, {"at": "after_area", "battery": battery_after}],
-		"segments": [{"type": "area", "coords": coords, "length": length, "chargers": []}],
+		"battery_plan": [{"at": "start", "battery": battery_pct}],
+		# Комбинированный маршрут: до зоны по graph, внутри coverage змейкой, далее выход по graph.
+		"segments": [
+			{"type": "approach_graph", "coords": _to_coord_list(route_info.get("approach_coords") or []), "length": float(route_info.get("approach_length", 0.0)), "chargers": []},
+			{"type": "coverage_area", "coords": coverage_coords, "length": float(route_info.get("coverage_length", 0.0)), "chargers": []},
+			{"type": "exit_graph", "coords": _to_coord_list(route_info.get("exit_coords") or []), "length": float(route_info.get("exit_length", 0.0)), "chargers": []},
+		],
 		"mission_mode": "operator_area",
 		"force_charge_after_route": bool(continuation_order),
+		"coverage_start_idx": int(route_info.get("coverage_start_idx", 0)),
+		"coverage_end_idx": int(route_info.get("coverage_end_idx", 0)),
 	}
 	return (result, continuation_order)
 
@@ -1025,19 +1280,24 @@ async def assign_orders():
 			if handover and (not remaining or tuple(remaining[0]) != tuple(handover)):
 				tmp_order["remaining_waypoints"] = [tuple(handover)] + [tuple(w) for w in remaining]
 			result, continuation = plan_operator_area_trip(drone, tmp_order)
-			if result and result.get("ok") and continuation:
+			if result and result.get("ok") and continuation and not any(o.get("id") == continuation.get("id") for o in STATE.get("orders", [])):
 				# Многошаговая передача area-задачи: каждый этап может создать следующий continuation.
 				STATE["orders"].append(continuation)
+				order["continuation_spawned"] = True
+				order["status"] = "waiting_continuation"
 			logger.info("assign_orders: area continuation order %s -> drone %s", order.get("id"), drone_id)
 		elif required_type == "operator" and order.get("area_polygon"):
 			order["mission_mode"] = "operator_area"
+			order["mission_id"] = str(order.get("mission_id") or order.get("id"))
 			if not order.get("area_waypoints"):
 				order["area_waypoints"] = [tuple(w) for w in _operator_area_waypoints(order)]
 			if not order.get("remaining_waypoints"):
 				order["remaining_waypoints"] = list(order.get("area_waypoints") or [])
 			result, continuation = plan_operator_area_trip(drone, order)
-			if result and result.get("ok") and continuation:
+			if result and result.get("ok") and continuation and not any(o.get("id") == continuation.get("id") for o in STATE.get("orders", [])):
 				STATE["orders"].append(continuation)
+				order["continuation_spawned"] = True
+				order["status"] = "waiting_continuation"
 				logger.info("assign_orders: created continuation order %s (handover at %s), first drone %s", continuation.get("id"), continuation.get("handover_point"), drone_id)
 			if not result or not result.get("ok"):
 				result = result or {"ok": False, "reason": "NO_PATH", "details": "operator area plan failed"}
@@ -1076,9 +1336,11 @@ async def assign_orders():
 				order["handover_history"] = list(continuation.get("handover_history") or order.get("handover_history") or [])
 				order["has_continuation"] = True
 				order["root_order_id"] = _operator_area_root_order_id(order)
+				order["continuation_spawned"] = True
 			else:
 				order["remaining_waypoints"] = []
 				order["has_continuation"] = False
+				order["continuation_spawned"] = False
 		order["chargers_used"] = result.get("chargers_used", [])
 		order["battery_plan"] = result.get("battery_plan", [])
 		order["segments"] = result.get("segments", [])
@@ -1187,6 +1449,12 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 			best_time = time_sec
 			best_drone_id = drone_id
 
+	# Для continuation/handover задач не спавним новый дрон автоматически:
+	# если свободных нет — заказ ждёт в очереди.
+	is_continuation = bool(order.get("remaining_waypoints") or order.get("handover_point") or order.get("is_area_continuation"))
+	if is_continuation and best_drone_id is None:
+		return None
+
 	# Вариант «новый дрон с базы» — сравниваем ETA
 	inv = STATE.get("inventory") or {}
 	has_inventory = (inv.get(required_drone_type, 0) or 0) > 0
@@ -1195,7 +1463,7 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 		time_new, _ = estimate_new_drone_completion_time_seconds(order, required_drone_type)
 		existing_best = best_time
 		if time_new < best_time:
-			new_id = spawn_drone_from_inventory(required_drone_type)
+			new_id = spawn_drone_from_inventory(required_drone_type, order_id=str(order.get("id")), caller="pick_drone_for_order")
 			if new_id:
 				logger.info(
 					"pick_drone_for_order: order=%s -> new drone %s (ETA %.0fs < existing best %.0fs)",
@@ -1539,6 +1807,7 @@ def simulate_step():
 	if not city or G is None:
 		return
 	for drone_id, drone in STATE["drones"].items():
+		_sanitize_active_drone_state(drone_id, drone)
 		if drone.get("status") == "avoidance":
 			_avoidance_step(drone_id, drone)
 			continue
@@ -1559,6 +1828,7 @@ def simulate_step():
 		# Движение по маршруту: не только enroute, но и поездка на зарядку
 		if drone.get("status") not in ("enroute", "return_charge", "return_base", "low_battery"):
 			continue
+		_mark_order_in_progress_if_started(drone_id, drone)
 		route = drone.get("route") or []
 		idx = drone.get("target_idx", 0)
 		if not route or idx >= len(route):
@@ -1791,8 +2061,9 @@ def _save_route_for_return_if_on_order(drone_id: str, drone: Dict[str, Any]) -> 
 	if drone.get("saved_route_for_charge") is not None:
 		return
 	for o in STATE.get("orders", []):
-		if o.get("drone_id") == drone_id and o.get("status") == "assigned":
+		if o.get("drone_id") == drone_id and o.get("status") in ("assigned", "in_progress", "waiting_continuation"):
 			drone["saved_order_id"] = o.get("id")
+			drone["active_order_id"] = o.get("id")
 			route = drone.get("route") or []
 			if route:
 				drone["saved_route_for_charge"] = list(route)
@@ -1802,12 +2073,16 @@ def _save_route_for_return_if_on_order(drone_id: str, drone: Dict[str, Any]) -> 
 
 def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 	"""После зарядки восстанавливаем маршрут заказа, если он был сохранён. Возвращает True, если восстановили."""
+	# Выход из charging: маршрут восстановлен — статус станет enroute в конце (исполняемое состояние, не «зарядка»).
 	if drone.get("saved_route_for_charge") is not None:
 		saved = drone.get("saved_route_for_charge") or []
 		drone["route"] = list(saved)
-		drone["target_idx"] = int(drone.get("saved_target_idx", 0))
+		sidx = int(drone.get("saved_target_idx", 0))
+		drone["target_idx"] = max(0, min(sidx, max(0, len(saved) - 1)))
 		drone["status"] = "enroute"
 		order_id = drone.pop("saved_order_id", None)
+		if order_id:
+			drone["active_order_id"] = order_id
 		drone.pop("saved_route_for_charge", None)
 		drone.pop("saved_target_idx", None)
 		logger.info("_restore_route_after_charging: restored route for order %s (%s waypoints from idx %s)", order_id, len(saved), drone.get("target_idx"))
@@ -1818,7 +2093,7 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 	if not order_id:
 		return False
 	order = next((o for o in STATE.get("orders", []) if o.get("id") == order_id), None)
-	if not order or order.get("status") != "assigned":
+	if not order or order.get("status") not in ("assigned", "in_progress", "waiting_continuation"):
 		# If order is gone or not assigned, don't replan.
 		return False
 
@@ -1826,7 +2101,39 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 		required_type = order.get("drone_type") or map_order_to_drone_type(order.get("type", "delivery"))
 		pos = tuple(drone.get("pos", (0.0, 0.0)))
 		if required_type == "cargo":
-			res = plan_order_trip(pos, order["start"], order["end"], "cargo", 100.0)
+			# Для cargo после промежуточной зарядки возвращаемся к текущей фазе заказа:
+			# если груз уже "на борту", не летим заново на pickup, а продолжаем к dropoff.
+			if _is_drone_loaded(drone):
+				G = STATE.get("city_graph")
+				charger_nodes = STATE.get("charger_nodes") or {"base": None, "stations": []}
+				start_node = _routing_service._find_nearest_node(G, pos) if G else None
+				drop_node = _routing_service._find_nearest_node(G, tuple(order["end"])) if G else None
+				if G and start_node and drop_node:
+					p1, c1, l1, ch1 = _routing_service.plan_with_chargers(
+						G, start_node, drop_node, 100.0, MODE_LOADED, "cargo", reserve_pct=PLAN_RESERVE_PCT, charger_nodes=charger_nodes,
+						max_segment_battery_pct=MAX_SEGMENT_BATTERY_PCT, max_battery_pct_to_reach_charger=MAX_BATTERY_PCT_TO_REACH_CHARGER,
+					)
+					if c1:
+						bat_after = 100.0 if ch1 else _routing_service.compute_battery_after(l1, 100.0, MODE_LOADED, "cargo")
+						exit_coords, exit_len = _best_escape_graph_path(tuple(c1[-1]), bat_after, "cargo")
+						full = _to_coord_list(c1)
+						full = _concat_coords(full, exit_coords)
+						res = {
+							"ok": True,
+							"coords": full,
+							"route_length": float(l1 + exit_len),
+							"pickup_waypoint_count": 0,
+							"segments": [
+								{"type": "to_dropoff", "coords": _to_coord_list(c1), "length": float(l1), "chargers": ch1},
+								{"type": "escape", "coords": exit_coords, "length": float(exit_len), "chargers": []},
+							],
+						}
+					else:
+						res = plan_order_trip(pos, order["start"], order["end"], "cargo", 100.0)
+				else:
+					res = plan_order_trip(pos, order["start"], order["end"], "cargo", 100.0)
+			else:
+				res = plan_order_trip(pos, order["start"], order["end"], "cargo", 100.0)
 		elif required_type == "operator" and (order.get("remaining_waypoints") or (order.get("handover_point") and order.get("rest_waypoints"))):
 			res = plan_operator_continuation_trip({"pos": pos, "battery": 100.0, "type": "operator"}, order)
 		elif required_type == "operator" and order.get("area_polygon"):
@@ -1842,11 +2149,19 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 		return False
 
 	if not res or not res.get("ok") or not res.get("coords"):
+		rt = order.get("drone_type") or map_order_to_drone_type(order.get("type", "delivery"))
+		if rt == "operator" and order.get("area_polygon") and not (order.get("remaining_waypoints") or []):
+			logger.warning(
+				"_restore_route_after_charging: replan empty for operator area order %s (no remaining waypoints)",
+				order.get("id"),
+			)
 		return False
 
 	drone["route"] = list(res["coords"])
 	drone["target_idx"] = 0
+	# После восстановления миссии обязательно возвращаем дрона в исполняемый статус.
 	drone["status"] = "enroute"
+	drone["active_order_id"] = order_id
 	drone.pop("saved_order_id", None)
 	logger.info("_restore_route_after_charging: replanned route for order %s (%s waypoints)", order_id, len(drone["route"]))
 	return True
@@ -1854,12 +2169,14 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 
 def _has_assigned_order_for_drone(drone_id: str) -> bool:
 	for o in STATE.get("orders", []):
-		if o.get("drone_id") == drone_id and o.get("status") == "assigned":
+		if o.get("drone_id") == drone_id and o.get("status") in ("assigned", "in_progress", "waiting_continuation"):
 			return True
 	return False
 
 
 def _resume_after_charge_or_hold(drone_id: str, drone: Dict[str, Any]) -> None:
+	# Дрон выходит из зарядки: сначала убираем из очередей (иначе UI и логика видят «в зарядке» при battery=100).
+	_remove_drone_from_charge_queues(drone_id)
 	# Восстановление маршрута после промежуточной зарядки:
 	# 1) сначала заранее сохранённый хвост маршрута,
 	# 2) затем пересборка по сохранённому order_id,
@@ -1869,13 +2186,23 @@ def _resume_after_charge_or_hold(drone_id: str, drone: Dict[str, Any]) -> None:
 		drone["route"] = list(resume)
 		drone["resume_route"] = []
 		drone["target_idx"] = 0
+		# После зарядки при восстановленном маршруте переводим в активный исполняемый статус.
 		drone["status"] = "enroute"
+		if drone.get("saved_order_id"):
+			drone["active_order_id"] = drone.get("saved_order_id")
 		return
 	if _restore_route_after_charging(drone):
 		return
+	# Нет resume_route и не удалось replan: operator area без хвоста — закрываем order после зарядки.
+	if _try_close_order_if_no_flight_after_charge(drone_id, drone):
+		if not _get_active_order_for_drone(drone_id):
+			drone["status"] = "idle"
+		return
 	if _has_assigned_order_for_drone(drone_id):
+		# Есть активный заказ, но route пока не восстановлен — удерживаем, не уходим в idle.
 		drone["status"] = "holding"
 		return
+	drone.pop("active_order_id", None)
 	drone["status"] = "idle"
 
 
@@ -1967,7 +2294,7 @@ def assign_to_charger_queue(drone_id: str) -> bool:
         sq = {"charged_batteries": STATION_CHARGED_BATTERIES_MAX, "charging_queue": [], "queue": []}
     if "charged_batteries" in sq:
         if drone_id in sq.get("queue", []):
-            return
+            return True
         if sq.get("charged_batteries", 0) > 0:
             sq["charged_batteries"] -= 1
             sq.setdefault("charging_queue", []).append(STATION_BATTERY_CHARGE_TICKS)
@@ -1994,7 +2321,8 @@ def progress_charging():
         if not d:
             continue
         d["battery"] = min(100.0, float(d.get("battery", 0.0)) + 4.0)  # 4% per tick
-        if d["battery"] >= 100.0:
+        if d["battery"] >= CHARGE_COMPLETE_PCT:
+            d["battery"] = 100.0
             done.append(did)
             _resume_after_charge_or_hold(did, d)
     for did in done:
@@ -2039,7 +2367,8 @@ def progress_charging():
                 if not d:
                     continue
                 d["battery"] = min(100.0, float(d.get("battery", 0.0)) + 4.0)
-                if d["battery"] >= 100.0:
+                if d["battery"] >= CHARGE_COMPLETE_PCT:
+                    d["battery"] = 100.0
                     if did in sq.get("queue", []):
                         sq["queue"].remove(did)
                     _resume_after_charge_or_hold(did, d)
@@ -2050,7 +2379,8 @@ def progress_charging():
                 if not d:
                     continue
                 d["battery"] = min(100.0, float(d.get("battery", 0.0)) + 4.0)
-                if d["battery"] >= 100.0:
+                if d["battery"] >= CHARGE_COMPLETE_PCT:
+                    d["battery"] = 100.0
                     done.append(did)
                     _resume_after_charge_or_hold(did, d)
             for did in done:
@@ -2060,6 +2390,9 @@ def progress_charging():
                 sq["charging"].append(sq["queue"].pop(0))
         sqs[key] = sq
     STATE["station_queues"] = sqs
+    # Нормализация: battery >= порога, status charging — недопустимо оставаться в charging (очередь/статус/маршрут).
+    for _did, _d in list((STATE.get("drones") or {}).items()):
+        _force_exit_charging_if_complete(_did, _d)
 
 def _area_chain_has_pending(root_order_id: str, exclude_order_id: Optional[str] = None) -> bool:
 	for o in STATE.get("orders", []):
@@ -2067,7 +2400,7 @@ def _area_chain_has_pending(root_order_id: str, exclude_order_id: Optional[str] 
 			continue
 		if _operator_area_root_order_id(o) != root_order_id:
 			continue
-		if o.get("status") in ("queued", "assigned", "in_progress"):
+		if o.get("status") in ("queued", "assigned", "in_progress", "waiting_continuation"):
 			return True
 	return False
 
@@ -2088,36 +2421,68 @@ def _mark_area_root_completed_if_ready(root_order_id: str) -> None:
 
 
 def mark_order_completed_if_any(drone_id: str):
-	# Заказ считаем завершенным только при реальном окончании маршрута задания, не при заезде на зарядку.
+	# Финализация заказа: выполняем только при реальном окончании миссии, не при промежуточной зарядке.
 	drone = STATE.get("drones", {}).get(drone_id)
 	if not drone:
 		return
 	route = drone.get("route") or []
 	if route and int(drone.get("target_idx", 0)) < len(route):
 		return
-	if drone.get("status") in ("charging", "return_charge", "return_base", "low_battery"):
+	# Во время зарядки не завершаем заказ (промежуточная остановка), кроме случая «зарядка завершена»:
+	# battery >= порога и дрон снимаем с charging-очередей — иначе in_progress зависает навсегда.
+	if drone.get("status") == "charging":
+		if float(drone.get("battery", 0.0)) < CHARGE_COMPLETE_PCT:
+			return
+		_remove_drone_from_charge_queues(drone_id)
+	elif drone.get("status") in ("return_charge", "return_base", "low_battery"):
 		return
 
-	for o in STATE.get("orders", []):
-		if o.get("drone_id") != drone_id or o.get("status") != "assigned":
-			continue
-		required_type = o.get("drone_type") or map_order_to_drone_type(o.get("type", "delivery"))
-		if required_type == "operator" and (o.get("area_polygon") or o.get("remaining_waypoints")):
-			# Защита от ложного завершения area-родителя: если есть continuation/остаток, родитель остаётся in_progress.
-			root_id = _operator_area_root_order_id(o)
-			if o.get("has_continuation") or (o.get("remaining_waypoints") or []):
-				o["status"] = "in_progress"
-			else:
-				o["status"] = "completed"
-			o.pop("drone_id", None)
-			_mark_area_root_completed_if_ready(root_id)
+	order = _get_active_order_for_drone(drone_id)
+	if not order:
+		if drone.get("status") == "charging" and float(drone.get("battery", 0.0)) >= CHARGE_COMPLETE_PCT:
+			drone["status"] = "idle"
+		return
+
+	required_type = order.get("drone_type") or map_order_to_drone_type(order.get("type", "delivery"))
+	if required_type == "operator" and (order.get("area_polygon") or order.get("remaining_waypoints")):
+		# area mission completed только при полном исчерпании remaining_waypoints и отсутствии continuation.
+		root_id = _operator_area_root_order_id(order)
+		rem = order.get("remaining_waypoints") or []
+		# После зарядки (battery полная) пустой route при ненулевом remaining — не handover, а восстановление миссии.
+		if rem and float(drone.get("battery", 0.0)) >= CHARGE_COMPLETE_PCT and not (drone.get("route") or []):
+			if _restore_route_after_charging(drone):
+				return
+			drone["status"] = "holding"
+			return
+		if order.get("has_continuation") or rem:
+			order["status"] = "waiting_continuation"
+			order.pop("drone_id", None)
 		else:
-			o["status"] = "completed"
+			order["status"] = "completed"
+			order.pop("drone_id", None)
+		_mark_area_root_completed_if_ready(root_id)
+	else:
+		# cargo/operator-point/cleaner завершаем только в конце основного маршрута миссии.
+		order["status"] = "completed"
+		order.pop("drone_id", None)
+
+	# Чистим активный контекст дрона после завершения/передачи.
+	drone.pop("active_order_id", None)
+	drone.pop("mission_mode", None)
+	drone["force_charge_after_route"] = False
+	# После завершения/передачи заказа дрон не должен оставаться в «зарядке» или holding без заказа.
+	if not _get_active_order_for_drone(drone_id) and drone.get("status") in ("charging", "holding"):
+		drone["status"] = "idle"
+
+	# Доп. защита: закрываем возможные дубликаты этого же order id в активных статусах.
+	for o in STATE.get("orders", []):
+		if o.get("id") != order.get("id"):
+			continue
+		if o is order:
+			continue
+		if o.get("status") in ("assigned", "in_progress", "waiting_continuation") and o.get("drone_id") == drone_id:
+			o["status"] = "cancelled"
 			o.pop("drone_id", None)
-		drone.pop("active_order_id", None)
-		drone.pop("mission_mode", None)
-		drone["force_charge_after_route"] = False
-		break
 
 # Telemetry helpers
 def compute_link_quality(drone: Dict[str, Any]):
@@ -2186,25 +2551,32 @@ def spawn_drone(drone_type: str, pos: Tuple[float, float], battery: float = 100.
     }
     return did
 
-def spawn_drone_from_inventory(pref_type: str) -> Optional[str]:
+def spawn_drone_from_inventory(pref_type: str, order_id: Optional[str] = None, caller: str = "unknown") -> Optional[str]:
     base = STATE.get("base")
     inv = STATE.get("inventory") or {}
     if not base:
         return None
-    # prefer requested type, else any available
-    types_to_try = [pref_type] + [t for t in ("cargo","operator","cleaner") if t != pref_type]
-    for t in types_to_try:
-        cnt = inv.get(t, 0)
-        try:
-            cnt = int(cnt)
-        except Exception:
-            cnt = 0
-        if cnt > 0:
-            did = spawn_drone(t, pos=tuple(base), battery=100.0)
-            inv[t] = cnt - 1
-            STATE["inventory"] = inv
-            return did
-    return None
+    # Запрещаем спавн без реального запаса inventory нужного типа.
+    cnt_raw = inv.get(pref_type, 0)
+    try:
+        cnt = int(cnt_raw)
+    except Exception:
+        cnt = 0
+    if cnt <= 0:
+        logger.info(
+            "spawn_drone_from_inventory: blocked type=%s order=%s caller=%s inventory_before=%s",
+            pref_type, order_id, caller, cnt_raw,
+        )
+        return None
+    before = cnt
+    did = spawn_drone(pref_type, pos=tuple(base), battery=100.0)
+    inv[pref_type] = cnt - 1
+    STATE["inventory"] = inv
+    logger.info(
+        "spawn_drone_from_inventory: spawned drone=%s type=%s order=%s caller=%s inventory_before=%s inventory_after=%s",
+        did, pref_type, order_id, caller, before, inv.get(pref_type, 0),
+    )
+    return did
 
 # Split a full route into two: up to first charger (station/base), then remainder to resume after charging
 def apply_midroute_charging(drone: Dict[str, Any], full_coords: List[Tuple[float, float]]):
