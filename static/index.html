@@ -567,7 +567,7 @@
             <h4>🏠 База и инвентарь</h4>
             <label>Координаты базы</label>
             <div class="row">
-                <input id="base" placeholder="48.7080, 44.5133"/>
+                <input id="base" placeholder="48.31779, 40.25948"/>
                 <button onclick="useClick('base')">📍</button>
             </div>
             <div class="row">
@@ -671,7 +671,7 @@
         <textarea id="stationsBulk" rows="3" placeholder="48.700000, 44.500000&#10;48.710000, 44.520000"></textarea>
         <button onclick="bulkAddStations()">➕ Добавить станции</button>
         <h4>🌆 Город</h4>
-		<input id="city" value="Volgograd, Russia" />
+		<input id="city" value="Kamensk-Shakhtinsky" />
         <button onclick="loadCity()">🗺️ Загрузить</button>
 	</div>
 	<div id="rightPanel">
@@ -701,7 +701,8 @@
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-let map = L.map('map').setView([48.7080, 44.5133], 12);
+// Default view: Kamensk-Shakhtinsky
+let map = L.map('map').setView([48.31779, 40.25948], 12);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
 let droneMarkers = {};
 let zoneLayers = [];

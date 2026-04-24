@@ -28,15 +28,20 @@ class DataService:
         # Настройка логирования
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
-        # optional Redis for caching heavy city data (короткий таймаут — без Redis старт не зависает)
+        # Redis в основном сервисе временно отключён: Redis используем только в Map_script (карта/плейсмент).
+        # Если понадобится — установите CORE_REDIS_ENABLED=1
+        core_redis_enabled = (os.environ.get("CORE_REDIS_ENABLED") or "").strip() in ("1", "true", "True", "yes", "on")
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-        try:
-            self._redis: Redis | None = Redis.from_url(redis_url, socket_connect_timeout=1.5)
-            # do not decode responses here; we store bytes for pickle blobs
-            self._redis.ping()
-        except Exception:
+        if core_redis_enabled:
+            try:
+                self._redis: Redis | None = Redis.from_url(redis_url, socket_connect_timeout=1.5)
+                # do not decode responses here; we store bytes for pickle blobs
+                self._redis.ping()
+            except Exception:
+                self._redis = None
+                self.logger.warning("Redis not available for DataService cache; falling back to disk")
+        else:
             self._redis = None
-            self.logger.warning("Redis not available for DataService cache; falling back to disk")
     
     def add_progress_callback(self, callback):
         self.progress_callbacks.append(callback)

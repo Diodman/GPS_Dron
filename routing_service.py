@@ -404,27 +404,29 @@ class RoutingService:
             
             # Если все еще нет узлов, ищем среди всех узлов (но ограничиваем количество)
             if not nodes_to_check:
-                self.logger.warning(f"Нет узлов в расширенном радиусе, ищем среди всех узлов")
-                max_nodes = min(5000, len(G.nodes))
-                nodes_checked = 0
-                
+                # Важно: не ограничиваемся первыми N узлами (на больших графах это даёт промахи).
+                # Делаем линейный проход по всем узлам с pos, без накопления списка.
+                self.logger.warning("Нет узлов в расширенном радиусе, ищем по всем узлам графа")
                 for node, attr in G.nodes(data=True):
                     try:
-                        if 'pos' not in attr:
+                        node_pos = attr.get('pos')
+                        if not node_pos or len(node_pos) != 2:
                             continue
-                        
-                        node_pos = attr['pos']
-                        if len(node_pos) != 2:
-                            continue
-                        
-                        nodes_to_check.append((node, node_pos))
-                        nodes_checked += 1
-                        
-                        if nodes_checked >= max_nodes:
-                            break
-                            
-                    except Exception as e:
+                        dist = np.sqrt((lat - node_pos[0])**2 + (lon - node_pos[1])**2)
+                        if dist < min_dist:
+                            min_dist = dist
+                            nearest_node = node
+                    except Exception:
                         continue
+                # Уже нашли nearest_node (или нет) — дальше стандартная логика не нужна.
+                if nearest_node:
+                    distance_meters = min_dist * 111000
+                    self.logger.debug(
+                        f"Найден ближайший узел {nearest_node} на расстоянии {distance_meters:.1f}м от {point} (full-scan)"
+                    )
+                else:
+                    self.logger.error(f"Не удалось найти ближайший узел для точки {point}")
+                return nearest_node
             
             # Находим ближайший узел среди отобранных
             for node, node_pos in nodes_to_check:

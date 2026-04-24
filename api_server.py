@@ -17,6 +17,7 @@ from redis import Redis
 from data_service import DataService
 from graph_service import GraphService
 from routing_service import RoutingService, MODE_EMPTY, MODE_LOADED
+from map_script_adapter import build_city_assets_from_map_script, build_city_graph_and_stations_from_map_script
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +79,20 @@ _data_service = DataService()
 _graph_service = GraphService()
 _routing_service = RoutingService(_graph_service)
 
-# Redis
+# Redis (app persistence)
+# Временно отключаем Redis для core-состояния: Redis используется только Map_script (карта/плейсмент).
+# Если понадобится вернуть — установите APP_REDIS_ENABLED=1
+APP_REDIS_ENABLED = (os.environ.get("APP_REDIS_ENABLED") or "").strip() in ("1", "true", "True", "yes", "on")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-try:
-    _redis: Redis | None = Redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-    _redis.ping()
-except Exception:
-    _redis = None
-    logger.warning("Redis is not available; running without persistence")
+if APP_REDIS_ENABLED:
+	try:
+		_redis: Redis | None = Redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+		_redis.ping()
+	except Exception:
+		_redis = None
+		logger.warning("Redis is not available; running without persistence")
+else:
+	_redis = None
 
 # Models
 class LoadCityRequest(BaseModel):
@@ -117,7 +124,7 @@ class NoFlyZone(BaseModel):
 
 # State
 STATE: Dict[str, Any] = {
-	"city": None,
+	"city": "Kamensk-Shakhtinsky",
 	"city_graph": None,
 	"orders": [],
 	"drones": {},  # drone_id -> {pos, type, battery, route, target_idx, status}
@@ -126,6 +133,17 @@ STATE: Dict[str, Any] = {
 	"zone_version": 0,
 	"weather": {"wind_mps": 3.0},
     "base": None,  # base location lat, lon
+	# Эшелоны (фиксированный ряд, как в Map_script/data_service.py)
+	"flight_levels": [
+		{"level": 1, "altitude_m": 40.0, "label": "Эшелон 1 (40 м)"},
+		{"level": 2, "altitude_m": 67.5, "label": "Эшелон 2 (67.5 м)"},
+		{"level": 3, "altitude_m": 95.0, "label": "Эшелон 3 (95 м)"},
+		{"level": 4, "altitude_m": 122.5, "label": "Эшелон 4 (122.5 м)"},
+		{"level": 5, "altitude_m": 150.0, "label": "Эшелон 5 (150 м)"},
+	],
+	# Кластеры баз: каждый кластер = база, ёмкость 100 дронов.
+	"base_clusters": [],  # list[{id, center:(lat,lon), capacity:int}]
+	"cluster_queues": {},  # cluster_id -> {charging:[], queue:[], capacity:int}
 	"inventory": {},  # type -> count available at base
 	"stations": [],  # list of (lat, lon)
     "station_queues": {},  # station_index -> {charging:[], queue:[], capacity:int} (legacy for base) or {charged_batteries:int, charging_queue:[ticks], queue:[drone_id]}
@@ -204,6 +222,10 @@ async def broadcast_state():
 		"drones": STATE["drones"],
 		"histories": {k: v.get("history", []) for k,v in STATE["drones"].items()},
 		"no_fly_zones": STATE["no_fly_zones"],
+		# Базы-кластеры и эшелоны — чтобы UI мог отрисовать и сразу использовать дроны.
+		"base": STATE.get("base"),
+		"base_clusters": STATE.get("base_clusters", []),
+		"flight_levels": STATE.get("flight_levels", []),
 		"stations": STATE.get("stations", []),
 		"station_states": _station_states_for_ui(),
 		"weather": STATE.get("weather", {}),
@@ -270,15 +292,54 @@ async def on_shutdown():
 @app.post("/api/load_city")
 async def load_city(body: LoadCityRequest):
 	try:
-		city_data = _data_service.get_city_data(body.city)
-		# inject current API no-fly zones into data prior to build
-		city_data['no_fly_zones'] = list(STATE["no_fly_zones"]) or city_data.get('no_fly_zones', [])
-		city_graph = _graph_service.build_city_graph(city_data, body.drone_type)
+		# Map + chargers from Map_script pipeline
+		city_graph, stations, clusters, flight_levels = build_city_assets_from_map_script(body.city)
+		# inject current API no-fly zones into graph (rectangles)
+		try:
+			city_graph = _graph_service._add_no_fly_zones(city_graph, list(STATE["no_fly_zones"]) or [])
+		except Exception:
+			pass
 		_routing_service.city_graphs[body.city] = city_graph
 		STATE["city"] = body.city
 		STATE["city_graph"] = city_graph
 		STATE["drone_type"] = body.drone_type
+		STATE["stations"] = stations
+		# Эшелоны и кластеры — берём из Map_script
+		if flight_levels:
+			STATE["flight_levels"] = flight_levels
+		# Кластеры баз: по центроидам кластеров (если есть)
+		if clusters:
+			# Map_script может вернуть десятки кластеров — для UI/симуляции ограничим количеством баз.
+			MAX_BASE_CLUSTERS = 10
+			cap = 100
+			# сортировка по весу (важности кластера)
+			try:
+				clusters_sorted = sorted(
+					[c for c in clusters if isinstance(c, dict) and c.get("center")],
+					key=lambda c: int(c.get("weight", 1) or 1),
+					reverse=True,
+				)
+			except Exception:
+				clusters_sorted = [c for c in clusters if isinstance(c, dict) and c.get("center")]
+			base_clusters = []
+			for i, c in enumerate(clusters_sorted[:MAX_BASE_CLUSTERS]):
+				cid = c.get("cluster_id") or str(i + 1)
+				center = tuple(c.get("center"))
+				base_clusters.append({"id": f"cluster_{cid}", "center": center, "capacity": cap})
+			STATE["base_clusters"] = base_clusters
+			STATE["cluster_queues"] = {
+				cl["id"]: {"charging": [], "queue": [], "capacity": 2}
+				for cl in base_clusters
+			}
+			# Для обратной совместимости: STATE["base"] = первый кластер
+			if base_clusters:
+				STATE["base"] = tuple(base_clusters[0]["center"])
 		refresh_charger_nodes()
+		# Если база уже задана — гарантируем, что дроны созданы сразу после загрузки города.
+		try:
+			ensure_base_drones()
+		except Exception:
+			logger.exception("ensure_base_drones after load_city failed")
 		await persist_state()
 		return {"ok": True, "stats": {
 			"nodes": len(city_graph.nodes),
@@ -296,7 +357,9 @@ async def get_state():
 		"drones_count": len(STATE["drones"]),
 		"no_fly_zones": STATE["no_fly_zones"],
 		"weather": STATE["weather"],
-		"base": STATE["base"],
+		"base": STATE.get("base"),
+		"base_clusters": STATE.get("base_clusters", []),
+		"flight_levels": STATE.get("flight_levels", []),
 		"inventory": STATE["inventory"],
 		"stations": STATE["stations"],
 		"station_states": _station_states_for_ui(),
@@ -527,6 +590,12 @@ class BaseConfig(BaseModel):
 async def set_base(cfg: BaseConfig):
     if cfg.base:
         STATE["base"] = tuple(cfg.base)
+        # Если кластеры баз не заданы — создаём один кластер на базе на 100 дронов.
+        # Это нужно, чтобы дроны сразу отображались и могли брать заказы без ручной настройки кластеров.
+        if not (STATE.get("base_clusters") or []):
+            cap = 100
+            STATE["base_clusters"] = [{"id": "cluster_1", "center": tuple(STATE["base"]), "capacity": cap}]
+            STATE["cluster_queues"] = {"cluster_1": {"charging": [], "queue": [], "capacity": 2}}
         # Update weather by base coordinates (best effort).
         try:
             lat, lon = float(STATE["base"][0]), float(STATE["base"][1])
@@ -547,7 +616,13 @@ async def set_base(cfg: BaseConfig):
     refresh_charger_nodes()
     ensure_base_drones()
     await persist_state()
-    return {"ok": True, "base": STATE["base"], "inventory": STATE["inventory"]}
+    return {
+        "ok": True,
+        "base": STATE.get("base"),
+        "inventory": STATE.get("inventory", {}),
+        "base_clusters": STATE.get("base_clusters", []),
+        "drones_count": len(STATE.get("drones", {})),
+    }
 
 @app.get("/api/base")
 async def get_base():
@@ -579,6 +654,78 @@ async def set_stations(cfg: StationsConfig):
         return {"ok": True, "stations": stations}
     except Exception as e:
         return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+
+
+class FlightLevelsConfig(BaseModel):
+	"""Конфиг эшелонов: список уровней вида {level:int, altitude_m:float, label?:str}."""
+	flight_levels: List[Dict[str, Any]]
+
+
+@app.get("/api/flight_levels")
+async def get_flight_levels():
+	return {"flight_levels": STATE.get("flight_levels", [])}
+
+
+@app.post("/api/flight_levels")
+async def set_flight_levels(cfg: FlightLevelsConfig):
+	levels = []
+	for item in cfg.flight_levels or []:
+		try:
+			lvl = int(item.get("level"))
+			alt = float(item.get("altitude_m"))
+		except Exception:
+			continue
+		if lvl <= 0 or alt <= 0:
+			continue
+		label = item.get("label") or f"Эшелон {lvl} ({alt:g} м)"
+		levels.append({"level": lvl, "altitude_m": alt, "label": str(label)})
+	levels = sorted(levels, key=lambda x: x["level"])
+	if not levels:
+		return JSONResponse(status_code=400, content={"ok": False, "error": "flight_levels empty/invalid"})
+	STATE["flight_levels"] = levels
+	await persist_state()
+	return {"ok": True, "flight_levels": levels}
+
+
+class BaseClustersConfig(BaseModel):
+	"""Кластеры баз: список центров. На каждый кластер автоматически лимит 100 дронов."""
+	clusters: List[Tuple[float, float]]
+	capacity_per_cluster: Optional[int] = 100
+
+
+@app.get("/api/base_clusters")
+async def get_base_clusters():
+	return {"clusters": STATE.get("base_clusters", []), "capacity_per_cluster": 100}
+
+
+@app.post("/api/base_clusters")
+async def set_base_clusters(cfg: BaseClustersConfig):
+	clusters = []
+	cap = int(cfg.capacity_per_cluster or 100)
+	cap = max(1, min(1000, cap))
+	for i, c in enumerate(cfg.clusters or []):
+		if isinstance(c, (list, tuple)) and len(c) == 2:
+			try:
+				center = (float(c[0]), float(c[1]))
+			except Exception:
+				continue
+			clusters.append({"id": f"cluster_{i+1}", "center": center, "capacity": cap})
+	STATE["base_clusters"] = clusters
+	# reset cluster queues (simple model)
+	STATE["cluster_queues"] = {
+		cl["id"]: {"charging": [], "queue": [], "capacity": 2}
+		for cl in clusters
+	}
+	# Backward compat: primary base = first cluster if base not set
+	if clusters and not STATE.get("base"):
+		STATE["base"] = tuple(clusters[0]["center"])
+	await persist_state()
+	# If no drones yet, spawn up to 100 per cluster (or cap) with default mix
+	try:
+		ensure_base_drones()
+	except Exception:
+		logger.exception("ensure_base_drones after set_base_clusters failed")
+	return {"ok": True, "base_clusters": clusters, "spawned": len(STATE.get("drones", {}))}
 
 def refresh_charger_nodes() -> None:
 	"""Bind base and stations to nearest graph nodes. Call after load_city, set_base, set_stations."""
@@ -938,6 +1085,15 @@ def _remove_drone_from_charge_queues(drone_id: str) -> None:
 		while drone_id in lst:
 			lst.remove(drone_id)
 	STATE["base_queue"] = bq
+	# Кластерные базы
+	cqs = STATE.setdefault("cluster_queues", {})
+	for _cid, cq in list(cqs.items()):
+		for key in ("charging", "queue"):
+			lst = cq.get(key) or []
+			while drone_id in lst:
+				lst.remove(drone_id)
+		cqs[_cid] = cq
+	STATE["cluster_queues"] = cqs
 	sqs = STATE.setdefault("station_queues", {})
 	for _key, sq in list(sqs.items()):
 		for key2 in ("charging", "queue"):
@@ -1240,12 +1396,14 @@ async def rebuild_graph_with_zones():
 	if not city:
 		return
 	try:
-		city_data = _data_service.get_city_data(city)
-		city_data['no_fly_zones'] = list(STATE["no_fly_zones"]) or city_data.get('no_fly_zones', [])
-		drone_type = STATE.get("drone_type") or "cargo"
-		city_graph = _graph_service.build_city_graph(city_data, drone_type)
+		city_graph, stations = build_city_graph_and_stations_from_map_script(city)
+		try:
+			city_graph = _graph_service._add_no_fly_zones(city_graph, list(STATE["no_fly_zones"]) or [])
+		except Exception:
+			pass
 		_routing_service.city_graphs[city] = city_graph
 		STATE["city_graph"] = city_graph
+		STATE["stations"] = stations
 		refresh_charger_nodes()
 		await persist_state()
 	except Exception:
@@ -1808,6 +1966,15 @@ def simulate_step():
 		return
 	for drone_id, drone in STATE["drones"].items():
 		_sanitize_active_drone_state(drone_id, drone)
+		# holding ticks: короткая пауза после смены эшелона/ожидания
+		if drone.get("status") == "holding" and int(drone.get("hold_ticks", 0) or 0) > 0:
+			drone["hold_ticks"] = int(drone.get("hold_ticks", 0) or 0) - 1
+			# Продолжаем полёт, если есть маршрут
+			if (drone.get("route") or []) and int(drone.get("target_idx", 0)) < len(drone.get("route") or []):
+				drone["status"] = "enroute"
+			else:
+				drone["status"] = "idle"
+			continue
 		if drone.get("status") == "avoidance":
 			_avoidance_step(drone_id, drone)
 			continue
@@ -1841,6 +2008,28 @@ def simulate_step():
 			continue
 		current = drone["pos"]
 		target = route[idx]
+		# Эшелон: поддерживаем план (если есть) и возможность смены эшелона в полёте.
+		# Если план не задан — держим эшелон по умолчанию.
+		try:
+			plan = drone.get("echelon_plan") or []
+			if isinstance(plan, list) and idx < len(plan):
+				desired_level = int(plan[idx])
+				if desired_level > 0:
+					drone["echelon_level"] = desired_level
+		except Exception:
+			pass
+		# Плавное изменение высоты (м/тик): меняем altitude_m в сторону высоты эшелона.
+		try:
+			target_alt = _echelon_altitude_m(int(drone.get("echelon_level") or 1))
+			cur_alt = float(drone.get("altitude_m", target_alt))
+			# скорость изменения эшелона: 6 м/тик (≈ 6 м/с при 1 тик/с)
+			step = 6.0
+			if abs(target_alt - cur_alt) <= step:
+				drone["altitude_m"] = target_alt
+			else:
+				drone["altitude_m"] = cur_alt + (step if target_alt > cur_alt else -step)
+		except Exception:
+			pass
 		# Для operator_area миссии не перепрокладываем через road graph:
 		# там маршрут уже задан внутренними координатами зоны осмотра.
 		if is_point_in_any_zone(target) and drone.get("mission_mode") != "operator_area":
@@ -1906,8 +2095,18 @@ def simulate_step():
 			# Move fractionally and apply basic collision avoidance
 			next_pos = move_towards(current, target, speed_mps / dist)
 			if will_collide(drone_id, next_pos):
-				drone["status"] = "avoidance"
-				drone["avoidance_ticks"] = drone.get("avoidance_ticks", 0) + 1
+				# Вместо "sidestep" в сторону — пытаемся сменить эшелон (подъём на 1 уровень), не слетая с карты.
+				fl = STATE.get("flight_levels") or []
+				max_level = max((int(x.get("level")) for x in fl if isinstance(x, dict) and x.get("level")), default=5)
+				cur_level = int(drone.get("echelon_level") or _default_echelon_level_for(drone.get("type", "cargo")))
+				if cur_level < max_level:
+					drone["echelon_level"] = cur_level + 1
+					# короткая пауза, чтобы "разойтись" по эшелонам
+					drone["status"] = "holding"
+					drone["hold_ticks"] = int(drone.get("hold_ticks", 0) or 0) + 1
+				else:
+					drone["status"] = "avoidance"
+					drone["avoidance_ticks"] = drone.get("avoidance_ticks", 0) + 1
 			else:
 				drone["pos"] = next_pos
 				drone["avoidance_ticks"] = 0
@@ -2185,6 +2384,13 @@ def _resume_after_charge_or_hold(drone_id: str, drone: Dict[str, Any]) -> None:
 	if resume:
 		drone["route"] = list(resume)
 		drone["resume_route"] = []
+		# эшелон-план хвоста
+		repl = drone.get("resume_echelon_plan") or []
+		if isinstance(repl, list) and repl:
+			drone["echelon_plan"] = list(repl)
+		else:
+			drone["echelon_plan"] = [int(drone.get("echelon_level") or 2)] * len(drone["route"])
+		drone["resume_echelon_plan"] = []
 		drone["target_idx"] = 0
 		# После зарядки при восстановленном маршруте переводим в активный исполняемый статус.
 		drone["status"] = "enroute"
@@ -2209,8 +2415,9 @@ def _resume_after_charge_or_hold(drone_id: str, drone: Dict[str, Any]) -> None:
 def maybe_route_to_base_or_station(drone: Dict[str, Any]):
 	"""Строит маршрут до ближайшей зарядки. При низком заряде — через другие станции (plan_with_chargers)."""
 	chargers: List[Tuple[float, float]] = []
-	if STATE.get("base"):
-		chargers.append(tuple(STATE["base"]))
+	home = drone.get("home_base") or STATE.get("base")
+	if home:
+		chargers.append(tuple(home))
 	chargers += [tuple(s) for s in STATE.get("stations", []) if isinstance(s, (list, tuple)) and len(s) == 2]
 	if not chargers:
 		return
@@ -2230,12 +2437,17 @@ def maybe_route_to_base_or_station(drone: Dict[str, Any]):
 	# Если прямой путь недостижим — строим маршрут через станции зарядки (plan_with_chargers)
 	if not coords:
 		G = STATE.get("city_graph")
-		charger_nodes = STATE.get("charger_nodes") or {"base": None, "stations": []}
+		# Привязываем "домашнюю базу" дрона к графу, не полагаясь на глобальную STATE["base"].
+		charger_nodes = dict(STATE.get("charger_nodes") or {"base": None, "stations": []})
+		try:
+			if G is not None and home and isinstance(home, (list, tuple)) and len(home) == 2:
+				charger_nodes["base"] = _routing_service._find_nearest_node(G, tuple(home))
+		except Exception:
+			pass
 		if G and charger_nodes.get("base") is not None or (charger_nodes.get("stations") or []):
 			start_node = _routing_service._find_nearest_node(G, pos)
 			goal_node = None
-			base_coords = STATE.get("base")
-			if base_coords and tuple(base_coords) == best:
+			if home and tuple(home) == best:
 				goal_node = charger_nodes.get("base")
 			else:
 				for i, s in enumerate(STATE.get("stations") or []):
@@ -2266,16 +2478,25 @@ def assign_to_charger_queue(drone_id: str) -> bool:
     if not d:
         return False
     pos = tuple(d.get("pos", (0,0)))
-    # База: зарядка на месте (как раньше)
-    base_close = STATE.get("base") and haversine_m(pos, tuple(STATE["base"])) < STATION_NEAR_METERS
+    # Кластерная база (домашняя база дрона): зарядка на месте
+    home = d.get("home_base") or STATE.get("base")
+    base_close = bool(home) and haversine_m(pos, tuple(home)) < STATION_NEAR_METERS
     if base_close:
-        q = STATE.get("base_queue") or {"charging": [], "queue": [], "capacity": 2}
+        cid = d.get("cluster_id")
+        # если дрон в кластере — используем отдельную очередь кластера, иначе legacy base_queue
+        if cid and (STATE.get("cluster_queues") or {}).get(cid) is not None:
+            q = (STATE.get("cluster_queues") or {}).get(cid) or {"charging": [], "queue": [], "capacity": 2}
+        else:
+            q = STATE.get("base_queue") or {"charging": [], "queue": [], "capacity": 2}
         if drone_id not in q["charging"] and drone_id not in q["queue"]:
             if len(q["charging"]) < q.get("capacity", 2):
                 q["charging"].append(drone_id)
             else:
                 q["queue"].append(drone_id)
-        STATE["base_queue"] = q
+        if cid and (STATE.get("cluster_queues") or {}).get(cid) is not None:
+            STATE.setdefault("cluster_queues", {})[cid] = q
+        else:
+            STATE["base_queue"] = q
         return True
     # Станции зарядки: смена аккумулятора (запас 20 заряженных)
     idx = nearest_station_index(pos)
@@ -2332,6 +2553,26 @@ def progress_charging():
     while len(bq["charging"]) < bq.get("capacity", 2) and bq["queue"]:
         bq["charging"].append(bq["queue"].pop(0))
     STATE["base_queue"] = bq
+    # cluster bases: same charging logic as base_queue (4% per tick)
+    cqs = STATE.get("cluster_queues") or {}
+    for cid, cq in list(cqs.items()):
+        done = []
+        for did in list(cq.get("charging", [])):
+            d = STATE["drones"].get(did)
+            if not d:
+                continue
+            d["battery"] = min(100.0, float(d.get("battery", 0.0)) + 4.0)
+            if d["battery"] >= CHARGE_COMPLETE_PCT:
+                d["battery"] = 100.0
+                done.append(did)
+                _resume_after_charge_or_hold(did, d)
+        for did in done:
+            if did in cq.get("charging", []):
+                cq["charging"].remove(did)
+        while len(cq.get("charging", [])) < cq.get("capacity", 2) and (cq.get("queue") or []):
+            cq.setdefault("charging", []).append(cq.setdefault("queue", []).pop(0))
+        cqs[cid] = cq
+    STATE["cluster_queues"] = cqs
     # Станции зарядки: смена аккумуляторов (тик зарядки в очереди, затем выдача ожидающим)
     sqs = STATE.get("station_queues") or {}
     for key, sq in sqs.items():
@@ -2486,7 +2727,7 @@ def mark_order_completed_if_any(drone_id: str):
 
 # Telemetry helpers
 def compute_link_quality(drone: Dict[str, Any]):
-    base = STATE.get("base")
+    base = drone.get("home_base") or STATE.get("base")
     if not base:
         drone["link_quality"] = 0.7  # default medium
         return
@@ -2507,23 +2748,84 @@ def compute_link_quality(drone: Dict[str, Any]):
         drone["link_quality"] = 0.5
 
 def ensure_base_drones():
-    base = STATE.get("base")
     inv = STATE.get("inventory") or {}
-    if not base or not isinstance(inv, dict):
-        return
     # If there are already drones, do not auto-spawn duplicates
     if STATE.get("drones"):
         return
-    total = sum(max(0, int(v)) for v in inv.values())
-    if total <= 0:
+    if not isinstance(inv, dict):
+        inv = {}
+
+    clusters = STATE.get("base_clusters") or []
+    base = STATE.get("base")
+    # Если кластеры не заданы — работаем как раньше: одна база
+    if not clusters:
+        if not base:
+            return
+        total = sum(max(0, int(v)) for v in inv.values()) if inv else 0
+        if total <= 0:
+            return
+        for typ, cnt in inv.items():
+            try:
+                n = max(0, int(cnt))
+            except Exception:
+                n = 0
+            for _ in range(n):
+                spawn_drone(typ, pos=tuple(base), battery=100.0)
         return
-    for typ, cnt in inv.items():
+
+    # Кластеры-базы: на каждый кластер до capacity (по умолчанию 100) дронов.
+    # Если inventory пустой — спавним случайную смесь cargo/operator/cleaner, суммарно 100 на кластер.
+    default_types = ["cargo", "operator", "cleaner"]
+    weights = []
+    total_inv = 0
+    for t in default_types:
         try:
-            n = max(0, int(cnt))
+            c = int(inv.get(t, 0) or 0)
         except Exception:
-            n = 0
-        for _ in range(n):
-            spawn_drone(typ, pos=tuple(base), battery=100.0)
+            c = 0
+        weights.append(max(0, c))
+        total_inv += max(0, c)
+    import random
+    if total_inv <= 0:
+        # Случайная смесь (главное: суммарно 100 на кластер). Весов inventory нет — выбираем доли случайно.
+        # Пример: cargo 40..70, operator 10..40, остаток cleaner.
+        weights = None
+
+    for cl in clusters:
+        try:
+            cid = cl.get("id")
+            center = tuple(cl.get("center"))
+            cap = int(cl.get("capacity", 100) or 100)
+        except Exception:
+            continue
+        cap = max(1, min(1000, cap))
+        # Сформируем список типов на кластер (случайная смесь или по весам inventory)
+        types_for_cluster: List[str] = []
+        if weights is None:
+            cargo_n = random.randint(int(cap * 0.4), int(cap * 0.7))
+            op_n = random.randint(int(cap * 0.1), max(int(cap * 0.1), cap - cargo_n))
+            cl_n = max(0, cap - cargo_n - op_n)
+            types_for_cluster = (["cargo"] * cargo_n) + (["operator"] * op_n) + (["cleaner"] * cl_n)
+            # если из-за округления не добрали/перебрали — выровняем
+            while len(types_for_cluster) < cap:
+                types_for_cluster.append(random.choice(default_types))
+            types_for_cluster = types_for_cluster[:cap]
+            random.shuffle(types_for_cluster)
+        else:
+            for _ in range(cap):
+                # выбор типа по весам inventory
+                r = random.randint(1, total_inv)
+                acc = 0
+                chosen = "cargo"
+                for t, w in zip(default_types, weights):
+                    acc += w
+                    if r <= acc:
+                        chosen = t
+                        break
+                types_for_cluster.append(chosen)
+
+        for chosen in types_for_cluster:
+            spawn_drone(chosen, pos=center, battery=100.0, cluster_id=cid, home_base=center)
 
 def _next_drone_id(drone_type: str) -> str:
     """Генерирует имя дрона по типу: грузовой1, операторский1, мойщик1 и т.д."""
@@ -2539,8 +2841,36 @@ def _next_drone_id(drone_type: str) -> str:
     return f"{name_ru}{next_num}"
 
 
-def spawn_drone(drone_type: str, pos: Tuple[float, float], battery: float = 100.0) -> str:
+def _default_echelon_level_for(drone_type: str) -> int:
+    # Простое правило: грузовой выше, оператор/мойщик ниже.
+    if drone_type == "cargo":
+        return 3
+    if drone_type == "operator":
+        return 2
+    return 2
+
+
+def _echelon_altitude_m(level: int) -> float:
+    levels = STATE.get("flight_levels") or []
+    for item in levels:
+        try:
+            if int(item.get("level")) == int(level):
+                return float(item.get("altitude_m"))
+        except Exception:
+            continue
+    # fallback: безопасная высота
+    return 95.0
+
+
+def spawn_drone(
+    drone_type: str,
+    pos: Tuple[float, float],
+    battery: float = 100.0,
+    cluster_id: Optional[str] = None,
+    home_base: Optional[Tuple[float, float]] = None,
+) -> str:
     did = _next_drone_id(drone_type)
+    echelon = _default_echelon_level_for(drone_type)
     STATE["drones"][did] = {
         "pos": pos,
         "type": drone_type,
@@ -2548,6 +2878,13 @@ def spawn_drone(drone_type: str, pos: Tuple[float, float], battery: float = 100.
         "route": [],
         "target_idx": 0,
         "status": "idle",
+        # эшелонирование
+        "echelon_level": echelon,
+        "altitude_m": _echelon_altitude_m(echelon),
+        "echelon_plan": [],  # list[int] aligned with route points (optional)
+        # кластерная база
+        "cluster_id": cluster_id,
+        "home_base": home_base,
     }
     return did
 
@@ -2587,7 +2924,7 @@ def apply_midroute_charging(drone: Dict[str, Any], full_coords: List[Tuple[float
             drone["target_idx"] = 0
             drone["status"] = "enroute" if full_coords else "idle"
             return
-        base = STATE.get("base")
+        base = drone.get("home_base") or STATE.get("base")
         split_idx = None
         for i in range(1, len(full_coords)):
             pt = tuple(full_coords[i])
@@ -2600,11 +2937,16 @@ def apply_midroute_charging(drone: Dict[str, Any], full_coords: List[Tuple[float
         if split_idx is not None:
             drone["route"] = list(full_coords[:split_idx+1])
             drone["resume_route"] = list(full_coords[split_idx+1:])
+            # Эшелон-план: первые точки до зарядки летим выше (чтобы легче развести по эшелонам)
+            drone["echelon_plan"] = [int(drone.get("echelon_level") or 2)] * len(drone["route"])
+            drone["resume_echelon_plan"] = [int(drone.get("echelon_level") or 2)] * len(drone["resume_route"])
             drone["target_idx"] = 0
             drone["status"] = "enroute"
         else:
             drone["route"] = list(full_coords)
             drone["resume_route"] = []
+            drone["echelon_plan"] = [int(drone.get("echelon_level") or 2)] * len(drone["route"])
+            drone["resume_echelon_plan"] = []
             drone["target_idx"] = 0
             drone["status"] = "enroute"
     except Exception:
@@ -2625,6 +2967,9 @@ async def persist_state():
             "no_fly_zones": STATE.get("no_fly_zones", []),
             "weather": STATE.get("weather", {}),
             "base": STATE.get("base"),
+            "base_clusters": STATE.get("base_clusters", []),
+            "cluster_queues": STATE.get("cluster_queues", {}),
+            "flight_levels": STATE.get("flight_levels", []),
             "inventory": STATE.get("inventory", {}),
             "stations": STATE.get("stations", []),
             "station_queues": STATE.get("station_queues", {}),
@@ -2650,6 +2995,22 @@ async def restore_state():
         STATE["no_fly_zones"] = data.get("no_fly_zones", [])
         STATE["weather"] = data.get("weather", {"wind_mps": 3.0})
         STATE["base"] = tuple(data.get("base")) if data.get("base") else None
+        STATE["base_clusters"] = data.get("base_clusters", []) or []
+        STATE["flight_levels"] = (
+            data.get("flight_levels", STATE.get("flight_levels", []))
+            or STATE.get("flight_levels", [])
+        )
+        # Очереди кластеров: если отсутствуют — инициализируем по base_clusters
+        if data.get("cluster_queues") is not None:
+            STATE["cluster_queues"] = data.get("cluster_queues") or {}
+        else:
+            STATE["cluster_queues"] = {}
+        if STATE.get("base_clusters") and not STATE.get("cluster_queues"):
+            STATE["cluster_queues"] = {
+                (str(c.get("id"))): {"charging": [], "queue": [], "capacity": 2}
+                for c in (STATE.get("base_clusters") or [])
+                if c and c.get("id")
+            }
         STATE["inventory"] = data.get("inventory", {})
         STATE["stations"] = data.get("stations", [])
         if data.get("station_queues"):
