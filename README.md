@@ -66,7 +66,7 @@ docker compose up --build
 ### 📋 Руководство по использованию
 
 #### 1. Загрузка данных города
-- Введите название города (например, "Волгоград, Россия")
+- Введите название города (например, "Балаково, Россия")
 - Нажмите "Загрузить" для загрузки данных OSM
 - Дождитесь построения графа
 
@@ -98,7 +98,7 @@ docker compose up --build
 
 #### Основные сервисы
 - **`api_server.py`**: FastAPI сервер с поддержкой WebSocket
-- **`data_service.py`**: Загрузка данных OSM и геокодинг
+- **`city_data_service.py`**: Загрузка данных OSM и геокодинг
 - **`graph_service.py`**: Построение графа города с бесполётными зонами
 - **`routing_service.py`**: Алгоритмы поиска пути и оптимизация
 
@@ -112,7 +112,7 @@ docker compose up --build
 ### 🌍 Поддерживаемые города
 
 Оптимизировано для российских городов с полной поддержкой геокодинга адресов:
-- Волгоград (основной)
+- Балаково (основной)
 - Москва
 - Санкт-Петербург
 - И многие другие...
@@ -199,7 +199,7 @@ docker compose up --build
 ### 📋 Usage Guide
 
 #### 1. Load City Data
-- Enter city name (e.g., "Volgograd, Russia")
+- Enter city name (e.g., "Balakovo, Russia")
 - Click "Загрузить" to load OSM data
 - Wait for graph construction
 
@@ -231,7 +231,7 @@ docker compose up --build
 
 #### Core Services
 - **`api_server.py`**: FastAPI server with WebSocket support
-- **`data_service.py`**: OSM data loading and geocoding
+- **`city_data_service.py`**: OSM data loading and geocoding
 - **`graph_service.py`**: City graph construction with no-fly zones
 - **`routing_service.py`**: Pathfinding algorithms and optimization
 
@@ -245,7 +245,7 @@ docker compose up --build
 ### 🌍 Supported Cities
 
 Optimized for Russian cities with full address geocoding support:
-- Volgograd (primary)
+- Balakovo (primary)
 - Moscow
 - St. Petersburg
 - And many more...
@@ -273,7 +273,7 @@ uvicorn api_server:app --reload
 
 ### 📊 Performance
 
-- **Graph Construction**: ~30s for Volgograd
+- **Graph Construction**: ~30s for Balakovo (may vary)
 - **Route Planning**: <1s per route
 - **Simulation**: 1Hz tick rate
 - **Memory Usage**: ~200MB with city data

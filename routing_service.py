@@ -173,8 +173,12 @@ class RoutingService:
             k = 5
             for node, dist in candidates_start[:k]:
                 G.add_edge(tmp_start, node, weight=max(1.0, dist), type='temp_connection')
+                if getattr(G, "is_directed", lambda: False)():
+                    G.add_edge(node, tmp_start, weight=max(1.0, dist), type='temp_connection')
             for node, dist in candidates_end[:k]:
                 G.add_edge(tmp_end, node, weight=max(1.0, dist), type='temp_connection')
+                if getattr(G, "is_directed", lambda: False)():
+                    G.add_edge(node, tmp_end, weight=max(1.0, dist), type='temp_connection')
 
             # Build waypoint chain
             sequence = [tmp_start]
@@ -186,7 +190,10 @@ class RoutingService:
                     node = (node[0], node[1] + 1)
                 G.add_node(node, pos=wp, type='temp')
                 for n, dist in sorted(candidates_start, key=lambda x: x[1])[:k]:
-                    G.add_edge(node, n, weight=max(1.0, _approx_dist(wp, G.nodes[n]['pos'])), type='temp_connection')
+                    w = max(1.0, _approx_dist(wp, G.nodes[n]['pos']))
+                    G.add_edge(node, n, weight=w, type='temp_connection')
+                    if getattr(G, "is_directed", lambda: False)():
+                        G.add_edge(n, node, weight=w, type='temp_connection')
                 sequence.append(node)
                 temp_nodes.append(node)
             sequence.append(tmp_end)
@@ -347,10 +354,58 @@ class RoutingService:
             if not point or len(point) != 2:
                 self.logger.warning(f"Некорректная точка: {point}")
                 return None
+
+            # Fast path: cached KDTree (for static graphs like infrastructure network)
+            try:
+                cache = getattr(G, "graph", {}).get("_kdtree_cache") if G is not None else None
+                if isinstance(cache, dict) and cache.get("kdtree") is not None:
+                    kdtree = cache["kdtree"]
+                    nodes = cache.get("nodes") or []
+                    # Sanity: cache must be consistent; otherwise drop to slow search and rebuild later
+                    if not nodes:
+                        raise ValueError("empty KDTree cache nodes")
+                    # kdtree expects [lat, lon]
+                    dist, idx = kdtree.query([float(point[0]), float(point[1])], k=1)
+                    idx_i = int(idx)
+                    if 0 <= idx_i < len(nodes):
+                        return nodes[idx_i]
+                    # If index is out of range (cache mismatch), ignore cache and fallback to slow path
+                    raise IndexError(f"KDTree index out of range: {idx_i} not in [0,{len(nodes)-1}]")
+            except Exception:
+                pass
             
             min_dist = float('inf')
             nearest_node = None
             
+            # Build KDTree cache when it is safe (static graph without temp nodes)
+            try:
+                if G is not None and getattr(G, "graph", None) is not None and G.graph.get("_kdtree_cache") is None:
+                    # Avoid caching for graphs with temp nodes (plan_direct_path injects them)
+                    has_temp = False
+                    for _n, _a in G.nodes(data=True):
+                        if (_a or {}).get("type") == "temp":
+                            has_temp = True
+                            break
+                    if not has_temp:
+                        coords = []
+                        nodes = []
+                        for n, a in G.nodes(data=True):
+                            pos = (a or {}).get("pos")
+                            if not pos or len(pos) != 2:
+                                continue
+                            nodes.append(n)
+                            coords.append([float(pos[0]), float(pos[1])])
+                        # Guarantee alignment between coords and nodes
+                        if len(coords) != len(nodes):
+                            # Do not cache inconsistent data; fall back to slow scan
+                            coords = []
+                            nodes = []
+                        if coords and len(coords) >= 10:
+                            from scipy.spatial import cKDTree
+                            G.graph["_kdtree_cache"] = {"kdtree": cKDTree(np.asarray(coords, dtype=float)), "nodes": nodes}
+            except Exception:
+                pass
+
             # Используем пространственный индекс для более точного поиска
             # Сначала найдем узлы в радиусе ~1км от точки
             search_radius = 0.01  # примерно 1км в градусах

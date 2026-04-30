@@ -6,17 +6,27 @@ import logging
 from typing import Dict, List, Any, Optional, Tuple
 from pydantic import BaseModel
 import math
+import time
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, Response
 import os
 import base64
 import json
+import hashlib
 from datetime import datetime
 from redis import Redis
 
-from data_service import DataService
+from city_data_service import DataService as CityDataService
+from data_service import DataService as InfraDataService
 from graph_service import GraphService
 from routing_service import RoutingService, MODE_EMPTY, MODE_LOADED
+from station_placement import pipeline_result_to_geojson, run_full_pipeline
+from voronoi_paths import build_voronoi_local_paths_fc
+
+import networkx as nx
+from scipy.spatial import cKDTree
+from shapely.geometry import shape as shapely_shape, Point as ShapelyPoint
+from shapely.prepared import prep as shapely_prep
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +58,18 @@ CHARGE_COMPLETE_PCT = 99.0
 # Скорость по умолчанию для оценки ETA (м/с), если ветер неизвестен
 DEFAULT_SPEED_MPS = 12.0
 
+# Infrastructure routing optimization knobs
+MAX_NEAREST_STATIONS = 8
+MAX_NEAREST_NETWORK_NODES = 12
+MAX_ROUTE_CANDIDATES = 20
+OFF_NETWORK_PENALTY = 1.45
+OFF_NETWORK_MAX_M = 1200.0
+ECHELON_CHANGE_PENALTY_M = 250.0
+OFF_NETWORK_LONG_PENALTY_M = 900.0
+
+# UI sanity limits are handled on the frontend (render caps).
+# Do NOT cap station placement in the pipeline here: it breaks A/B balance and downstream local/voronoi networks.
+
 # Failure reasons for plan_order_trip
 NO_PATH_TO_PICKUP = "NO_PATH_TO_PICKUP"
 NO_FEASIBLE_CHARGING_CHAIN_TO_PICKUP = "NO_FEASIBLE_CHARGING_CHAIN_TO_PICKUP"
@@ -74,7 +96,8 @@ async def favicon():
 	return Response(content=FAVICON_PNG, media_type="image/png")
 
 # Services
-_data_service = DataService()
+_data_service = CityDataService()
+_infra_data_service = InfraDataService()
 _graph_service = GraphService()
 _routing_service = RoutingService(_graph_service)
 
@@ -91,6 +114,7 @@ except Exception:
 class LoadCityRequest(BaseModel):
 	city: str
 	drone_type: str = "cargo"
+	force_rebuild: bool = False
 
 class AddOrderRequest(BaseModel):
 	address_from: Optional[str] = None
@@ -132,6 +156,24 @@ STATE: Dict[str, Any] = {
     "base_queue": {"charging": [], "queue": [], "capacity": 2},
 	"charger_nodes": {"base": None, "stations": []},
 	"battery_mode": "reality",  # "reality" | "test" — в тесте укороченная дальность для проверки маршрутов
+
+	# Infrastructure (pipeline from station_placement/voronoi_paths)
+	"infrastructure": None,         # normalized dict for logic (stations/paths/clusters/echelons)
+	"infrastructure_geojson": None, # raw geojson payload for UI layers
+	"infrastructure_graph": None,   # nx.Graph for routing over infrastructure
+	"infrastructure_version": 0,
+
+	# Infrastructure build status (anti-duplication)
+	"infrastructure_build_status": "idle",  # idle|building|ready|error
+	"infrastructure_build_city": None,
+	"infrastructure_build_started_at": None,
+	"infrastructure_build_finished_at": None,
+	"infrastructure_build_last_error": None,
+	"infrastructure_build_stage": None,
+	"infrastructure_build_stage_detail": None,
+	"infrastructure_build_stage_ts": None,
+	# cache buster for placement cache keys (increment to ignore old saved placement)
+	"placement_cache_buster": 0,
 }
 
 # Helpers
@@ -208,6 +250,7 @@ async def broadcast_state():
 		"station_states": _station_states_for_ui(),
 		"weather": STATE.get("weather", {}),
 		"battery_mode": STATE.get("battery_mode", "reality"),
+		"infrastructure_version": int(STATE.get("infrastructure_version") or 0),
 	}
 	dead: List[WebSocket] = []
 	for ws in list(STATE["clients"]):
@@ -225,8 +268,19 @@ async def broadcaster_loop():
 
 async def scheduler_loop():
 	# very simple loop: assign queued orders, move drones, reroute on zones
+	last_tick_log = 0.0
 	while True:
 		try:
+			now = time.time()
+			if now - last_tick_log >= 2.0:
+				queued = sum(1 for o in (STATE.get("orders") or []) if o.get("status") == "queued")
+				free = sum(
+					1
+					for _id, d in (STATE.get("drones") or {}).items()
+					if (d or {}).get("status") in (None, "idle")
+				)
+				logger.info("scheduler_tick orders_queued=%s drones_free=%s infra_ready=%s", queued, free, is_infrastructure_routing_ready())
+				last_tick_log = now
 			await assign_orders()
 			simulate_step()
 		except Exception:
@@ -270,6 +324,11 @@ async def on_shutdown():
 @app.post("/api/load_city")
 async def load_city(body: LoadCityRequest):
 	try:
+		if body.force_rebuild:
+			logger.info("load_city rebuild requested city=%s force_rebuild=true", body.city)
+			STATE["placement_cache_buster"] = int(STATE.get("placement_cache_buster") or 0) + 1
+			_clear_infrastructure_runtime()
+		# City graph uses CityDataService (geocoding/legacy graph) which may not support force_refresh.
 		city_data = _data_service.get_city_data(body.city)
 		# inject current API no-fly zones into data prior to build
 		city_data['no_fly_zones'] = list(STATE["no_fly_zones"]) or city_data.get('no_fly_zones', [])
@@ -278,7 +337,16 @@ async def load_city(body: LoadCityRequest):
 		STATE["city"] = body.city
 		STATE["city_graph"] = city_graph
 		STATE["drone_type"] = body.drone_type
+		# Ensure we have a base/inventory so drones exist even while infrastructure is building.
+		if not STATE.get("base"):
+			# Balakovo default (project-wide convention)
+			STATE["base"] = (52.0278, 47.8007)
+		if not isinstance(STATE.get("inventory"), dict) or not STATE.get("inventory"):
+			STATE["inventory"] = {"cargo": 30, "operator": 10, "cleaner": 10}
+		# Build UAV infrastructure right after city load (anti-dup; may run in background)
+		_ensure_infrastructure_build(body.city, force=bool(body.force_rebuild))
 		refresh_charger_nodes()
+		ensure_base_drones()
 		await persist_state()
 		return {"ok": True, "stats": {
 			"nodes": len(city_graph.nodes),
@@ -301,7 +369,137 @@ async def get_state():
 		"stations": STATE["stations"],
 		"station_states": _station_states_for_ui(),
 		"battery_mode": STATE.get("battery_mode", "reality"),
+		"infrastructure_version": int(STATE.get("infrastructure_version") or 0),
 	}
+
+
+@app.get("/api/infrastructure")
+async def get_infrastructure():
+	"""Normalized infrastructure payload used by server logic and UI toggles."""
+	return {
+		"ok": True,
+		"city": STATE.get("city"),
+		"version": int(STATE.get("infrastructure_version") or 0),
+		"build_status": STATE.get("infrastructure_build_status"),
+		"build_city": STATE.get("infrastructure_build_city"),
+		"last_error": STATE.get("infrastructure_build_last_error"),
+		"infrastructure": STATE.get("infrastructure"),
+	}
+
+
+@app.get("/api/infrastructure/geojson")
+async def get_infrastructure_geojson():
+	"""GeoJSON layers for Leaflet UI."""
+	return {
+		"ok": True,
+		"city": STATE.get("city"),
+		"version": int(STATE.get("infrastructure_version") or 0),
+		"build_status": STATE.get("infrastructure_build_status"),
+		"build_city": STATE.get("infrastructure_build_city"),
+		"last_error": STATE.get("infrastructure_build_last_error"),
+		"geojson": STATE.get("infrastructure_geojson"),
+	}
+
+
+@app.get("/api/infrastructure/debug")
+async def infrastructure_debug():
+	geo = STATE.get("infrastructure_geojson") or {}
+	G = STATE.get("infrastructure_graph")
+	def _examples(fc):
+		if isinstance(fc, dict) and fc.get("type") == "FeatureCollection":
+			return (fc.get("features") or [])[:3]
+		return []
+	drones = STATE.get("drones") or {}
+	by_type = {"cargo":0,"operator":0,"cleaner":0}
+	for _id, d in drones.items():
+		t = (d or {}).get("type")
+		if t in by_type:
+			by_type[t] += 1
+	return {
+		"ok": True,
+		"city": STATE.get("city"),
+		"build_status": STATE.get("infrastructure_build_status"),
+		"build_city": STATE.get("infrastructure_build_city"),
+		"version": int(STATE.get("infrastructure_version") or 0),
+		"pipeline_params": STATE.get("infrastructure_pipeline_params") or _pipeline_params_app_defaults(),
+		"raw_counts": STATE.get("infrastructure_raw_counts") or {},
+		"started_at": STATE.get("infrastructure_build_started_at"),
+		"finished_at": STATE.get("infrastructure_build_finished_at"),
+		"last_error": STATE.get("infrastructure_build_last_error"),
+		"build_stage_hint": {
+			"stage": STATE.get("infrastructure_build_stage"),
+			"detail": STATE.get("infrastructure_build_stage_detail"),
+			"ts": STATE.get("infrastructure_build_stage_ts"),
+		},
+		"build_elapsed_s": (
+			(datetime.utcnow() - datetime.fromisoformat(STATE["infrastructure_build_started_at"])).total_seconds()
+			if STATE.get("infrastructure_build_started_at")
+			else None
+		),
+		"geojson_keys": sorted(list(geo.keys())) if isinstance(geo, dict) else [],
+		"ui_drawn_keys_hint": sorted([k for k in (geo.keys() if isinstance(geo, dict) else []) if isinstance(geo.get(k), dict) and geo.get(k, {}).get("type") == "FeatureCollection"]),
+		"layer_counts": _layer_counts(geo if isinstance(geo, dict) else {}),
+		"layer_examples": {
+			"charge_a": _examples((geo or {}).get("charging_type_a")),
+			"charge_b": _examples((geo or {}).get("charging_type_b")),
+			"maintenance": _examples((geo or {}).get("to_stations")),
+			"garages": _examples((geo or {}).get("garages")),
+			"trunk": _examples((geo or {}).get("trunk")),
+			"branch": _examples((geo or {}).get("branch_edges")),
+			"local": _examples((geo or {}).get("local_edges")),
+			"voronoi": _examples((geo or {}).get("voronoi_edges")),
+			"cluster_hulls": _examples((geo or {}).get("cluster_hulls")),
+		},
+		"infrastructure_graph": {
+			"nodes": int(G.number_of_nodes()) if G is not None else 0,
+			"edges": int(G.number_of_edges()) if G is not None else 0,
+			"ok_graph": bool(G is not None and int(G.number_of_nodes()) > 0 and int(G.number_of_edges()) > 0),
+		},
+		"drones_by_type": by_type,
+		"last_route_debug": STATE.get("last_route_debug"),
+	}
+
+
+@app.get("/api/drones")
+async def list_drones():
+	"""Debug-friendly: full in-memory drones (includes route_segments)."""
+	return {"ok": True, "drones": STATE.get("drones", {})}
+
+
+@app.post("/api/clear_cache")
+async def clear_cache(body: Dict[str, Any] | None = None):
+	"""
+	Clear runtime infrastructure caches and bump placement cache buster.
+	Does not delete code or disk files; only affects in-memory/Redis placement keys.
+	"""
+	STATE["placement_cache_buster"] = int(STATE.get("placement_cache_buster") or 0) + 1
+	_clear_infrastructure_runtime()
+	# Also clear drone placement so next load_city can respawn from infra when ready
+	STATE["drones"] = {}
+	STATE["orders"] = []
+	refresh_charger_nodes()
+	await persist_state()
+	return {"ok": True, "placement_cache_buster": int(STATE.get("placement_cache_buster") or 0)}
+
+
+@app.post("/api/rebuild_infrastructure")
+async def api_rebuild_infrastructure(body: Dict[str, Any] | None = None):
+	city = (body or {}).get("city") if isinstance(body, dict) else None
+	city = (city or STATE.get("city") or "").strip()
+	force = True if not isinstance(body, dict) else bool((body or {}).get("force", True))
+	if not city:
+		return JSONResponse(status_code=400, content={"ok": False, "error": "city is required (or load_city first)"})
+	try:
+		logger.info("rebuild requested city=%s force=%s", city, force)
+		if force:
+			STATE["placement_cache_buster"] = int(STATE.get("placement_cache_buster") or 0) + 1
+		started = _ensure_infrastructure_build(city, force=force)
+		refresh_charger_nodes()
+		await persist_state()
+		return {"ok": True, "city": city, "started": started, "version": int(STATE.get("infrastructure_version") or 0)}
+	except Exception as e:
+		logger.exception("rebuild_infrastructure failed")
+		return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
 
 @app.post("/api/reverse")
 async def reverse_geocode(body: Dict[str, float]):
@@ -368,6 +566,9 @@ async def add_order(order: AddOrderRequest):
 		req_drone_type = map_order_to_drone_type(order_type)
 	start = await resolve_point(order.coords_from, order.address_from)
 	end = await resolve_point(order.coords_to, order.address_to)
+	start = normalize_latlon(start, ctx="add_order.start") if start else start
+	end = normalize_latlon(end, ctx="add_order.end") if end else end
+	# Guard: if route would be zero but points differ, keep order queued (validation later in planner too)
 	# Операторский/сервисный: точка назначения может быть без «откуда» — старт с базы
 	if not start and req_drone_type in ("operator", "cleaner"):
 		base = STATE.get("base")
@@ -473,7 +674,8 @@ async def fetch_weather(lat: Optional[float] = None, lon: Optional[float] = None
 		if base and len(base) == 2:
 			lat, lon = float(base[0]), float(base[1])
 		else:
-			lat, lon = 48.7080, 44.5133
+			# Default fallback: Balakovo
+			lat, lon = 52.0278, 47.8007
 	data = await fetch_weather_from_api(lat, lon)
 	if data:
 		STATE["weather"] = data
@@ -582,6 +784,7 @@ async def set_stations(cfg: StationsConfig):
 
 def refresh_charger_nodes() -> None:
 	"""Bind base and stations to nearest graph nodes. Call after load_city, set_base, set_stations."""
+	# Chargers are used by door-to-door + plan_with_chargers logic, which must be stable on city_graph.
 	G = STATE.get("city_graph")
 	if G is None:
 		STATE["charger_nodes"] = {"base": None, "stations": []}
@@ -599,17 +802,1208 @@ def refresh_charger_nodes() -> None:
 		else:
 			cn["stations"].append(None)
 	STATE["charger_nodes"] = cn
-	logger.debug("charger_nodes refreshed: base=%s stations=%s", cn["base"], cn["stations"])
+	logger.debug("charger_nodes refreshed (city_graph): base=%s stations=%s", cn["base"], cn["stations"])
+
+
+def get_active_routing_graph():
+	"""Routing graph used for default door-to-door planning (always city_graph)."""
+	return STATE.get("city_graph")
+
+
+def is_infrastructure_routing_ready() -> bool:
+	"""True only when infra layers and graph are sufficient for routing (otherwise use city_graph)."""
+	try:
+		geo = STATE.get("infrastructure_geojson") or {}
+		lc = _layer_counts(geo if isinstance(geo, dict) else {})
+		G = STATE.get("infrastructure_graph")
+		ok_layers = (
+			int(lc.get("charge_a") or 0) > 0
+			and int(lc.get("charge_b") or 0) > 0
+			and int(lc.get("branch") or 0) > 0
+			and int(lc.get("local") or 0) > 0
+		)
+		ok_graph = G is not None and int(G.number_of_nodes()) > 0 and int(G.number_of_edges()) > 0
+		return bool(ok_layers and ok_graph)
+	except Exception:
+		return False
+
+
+def limited_charger_nodes(point: Tuple[float, float]) -> Dict[str, Any]:
+	"""
+	Return charger_nodes dict but only with nearest station nodes (performance guard).
+	Stations are matched by index to STATE["stations"] and STATE["charger_nodes"]["stations"].
+	"""
+	out = {"base": None, "stations": []}
+	cn = STATE.get("charger_nodes") or {"base": None, "stations": []}
+	out["base"] = cn.get("base")
+	stations = STATE.get("stations") or []
+	nodes = cn.get("stations") or []
+	cands = []
+	for i, s in enumerate(stations):
+		if i >= len(nodes):
+			break
+		n = nodes[i]
+		if not n:
+			continue
+		try:
+			pos = tuple(s)
+			d = haversine_m(tuple(point), pos)
+			cands.append((d, n))
+		except Exception:
+			continue
+	cands.sort(key=lambda x: x[0])
+	out["stations"] = [n for _d, n in cands[:MAX_NEAREST_STATIONS]]
+	return out
+
+
+def _rect_from_zone(z: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+	try:
+		return (float(z["lat_min"]), float(z["lat_max"]), float(z["lon_min"]), float(z["lon_max"]))
+	except Exception:
+		return None
+
+
+def _segment_intersects_any_zone(a: Tuple[float, float], b: Tuple[float, float]) -> bool:
+	"""Fast check for rectangular zones (MVP zones in this server)."""
+	lat1, lon1 = float(a[0]), float(a[1])
+	lat2, lon2 = float(b[0]), float(b[1])
+	min_lat, max_lat = (lat1, lat2) if lat1 <= lat2 else (lat2, lat1)
+	min_lon, max_lon = (lon1, lon2) if lon1 <= lon2 else (lon2, lon1)
+	for z in (STATE.get("no_fly_zones") or []):
+		r = _rect_from_zone(z) if isinstance(z, dict) else None
+		if not r:
+			continue
+		zlat_min, zlat_max, zlon_min, zlon_max = r
+		# bbox overlap (coarse) — enough for MVP rectangles
+		if max_lat < zlat_min or min_lat > zlat_max or max_lon < zlon_min or min_lon > zlon_max:
+			continue
+		return True
+	return False
+
+
+def _geojson_features_to_lines(geo: Dict[str, Any]) -> List[Dict[str, Any]]:
+	fc = geo if isinstance(geo, dict) else {}
+	if fc.get("type") == "FeatureCollection":
+		return list(fc.get("features") or [])
+	return []
+
+
+def _round_key(lon: float, lat: float, p: int = 6) -> Tuple[float, float]:
+	return (round(float(lon), p), round(float(lat), p))
+
+
+def build_infrastructure_graph(infra_geojson: Dict[str, Any]) -> nx.Graph:
+	"""
+	Build a lightweight routing graph from infrastructure geojson layers:
+	- trunk/branch/local edges: echelon 4 (default)
+	- voronoi edges: echelon from voronoi_edges_by_echelon if provided, else 2
+	Nodes are keyed by rounded (lon,lat).
+	"""
+	G = nx.Graph()
+
+	def add_lines(features: List[Dict[str, Any]], *, layer: str, echelon_level: int):
+		for f in features:
+			geom = (f or {}).get("geometry") or {}
+			if (geom.get("type") or "").lower() != "linestring":
+				continue
+			coords = geom.get("coordinates") or []
+			if not isinstance(coords, list) or len(coords) < 2:
+				continue
+			for i in range(len(coords) - 1):
+				try:
+					lon1, lat1 = coords[i]
+					lon2, lat2 = coords[i + 1]
+					k1 = _round_key(lon1, lat1)
+					k2 = _round_key(lon2, lat2)
+					if k1 not in G:
+						G.add_node(k1, pos=(float(lat1), float(lon1)))
+					if k2 not in G:
+						G.add_node(k2, pos=(float(lat2), float(lon2)))
+					a = (float(lat1), float(lon1))
+					b = (float(lat2), float(lon2))
+					w = haversine_m(a, b)
+					if w <= 0:
+						continue
+					# Keep smallest weight if duplicate edge
+					edata = G.get_edge_data(k1, k2) or {}
+					old_w = edata.get("weight")
+					if old_w is None or float(w) < float(old_w):
+						G.add_edge(
+							k1,
+							k2,
+							length_m=float(w),
+							weight=float(w),
+							layer=layer,
+							flight_level=int(echelon_level),
+						)
+				except Exception:
+					continue
+
+	# Trunk/branch/local
+	add_lines(_geojson_features_to_lines(infra_geojson.get("trunk") or {}), layer="trunk", echelon_level=4)
+	add_lines(_geojson_features_to_lines(infra_geojson.get("branch_edges") or {}), layer="branch", echelon_level=4)
+	add_lines(_geojson_features_to_lines(infra_geojson.get("local_edges") or {}), layer="local", echelon_level=4)
+
+	# Voronoi: prefer per-echelon
+	vbe = infra_geojson.get("voronoi_edges_by_echelon") or {}
+	if isinstance(vbe, dict) and vbe:
+		for sk, sub in vbe.items():
+			try:
+				level = int(sk)
+			except Exception:
+				level = 2
+			add_lines(_geojson_features_to_lines(sub), layer="voronoi", echelon_level=level)
+	else:
+		add_lines(_geojson_features_to_lines(infra_geojson.get("voronoi_edges") or {}), layer="voronoi", echelon_level=2)
+
+	return G
+
+
+def _infra_graph_build_kdtree(G: nx.Graph) -> None:
+	"""Caches KDTree for infrastructure graph nodes to speed up nearest-node queries and candidate generation."""
+	try:
+		coords = []
+		nodes = []
+		for n, a in G.nodes(data=True):
+			pos = (a or {}).get("pos")
+			if not pos or len(pos) != 2:
+				continue
+			coords.append([float(pos[0]), float(pos[1])])  # [lat, lon]
+			nodes.append(n)
+		if not coords:
+			return
+		G.graph["_infra_node_kdtree"] = {
+			"kdtree": cKDTree(np.asarray(coords, dtype=float)),
+			"nodes": nodes,
+			"coords": coords,
+		}
+	except Exception:
+		return
+
+
+def _infra_graph_nearest_nodes(G: nx.Graph, point: Tuple[float, float], k: int) -> List[Tuple[Any, float]]:
+	"""Return up to k nearest infrastructure nodes as (node_id, approx_dist_m)."""
+	if G is None or G.number_of_nodes() == 0:
+		logger.debug("_infra_graph_nearest_nodes: empty graph k=%s", k)
+		return []
+	try:
+		k_req = int(k)
+	except Exception:
+		k_req = 1
+	if k_req <= 0:
+		k_req = 1
+
+	# Ensure KDTree cache exists
+	cache = (G.graph or {}).get("_infra_node_kdtree") if getattr(G, "graph", None) is not None else None
+	if not (isinstance(cache, dict) and cache.get("kdtree") is not None):
+		_infra_graph_build_kdtree(G)
+		cache = (G.graph or {}).get("_infra_node_kdtree") if getattr(G, "graph", None) is not None else None
+
+	nodes_count = int(G.number_of_nodes())
+	try:
+		pt = [float(point[0]), float(point[1])]  # [lat, lon]
+	except Exception:
+		return []
+
+	# Primary: KDTree query
+	if isinstance(cache, dict) and cache.get("kdtree") is not None:
+		try:
+			nodes = cache.get("nodes") or []
+			k_eff = max(1, min(k_req, len(nodes)))
+			if k_eff <= 0:
+				logger.debug("_infra_graph_nearest_nodes: nodes=%s k=%s -> 0 candidates", nodes_count, k_req)
+				return []
+
+			dists, idxs = cache["kdtree"].query(pt, k=k_eff)
+			if k_eff == 1:
+				dists = [float(dists)]
+				idxs = [int(idxs)]
+
+			out: List[Tuple[Any, float]] = []
+			for d, idx in zip(dists, idxs):
+				i = int(idx)
+				if i < 0 or i >= len(nodes):
+					continue
+				approx_m = float(d) * 111_000.0
+				out.append((nodes[i], approx_m))
+
+			logger.debug(
+				"_infra_graph_nearest_nodes: nodes=%s k=%s -> %s candidates",
+				nodes_count,
+				k_eff,
+				len(out),
+			)
+			return out
+		except Exception:
+			# Fall back to slow scan below
+			pass
+
+	# Fallback: slow scan (rough degree-distance)
+	try:
+		best: List[Tuple[Any, float]] = []
+		lat, lon = float(point[0]), float(point[1])
+		for n, a in G.nodes(data=True):
+			pos = (a or {}).get("pos")
+			if not pos or len(pos) != 2:
+				continue
+			d = float(np.hypot(lat - float(pos[0]), lon - float(pos[1])))
+			best.append((n, d * 111_000.0))
+		best.sort(key=lambda x: x[1])
+		out = best[: max(1, min(k_req, len(best)))]
+		logger.debug(
+			"_infra_graph_nearest_nodes: nodes=%s k=%s -> %s candidates (slow)",
+			nodes_count,
+			k_req,
+			len(out),
+		)
+		return out
+	except Exception:
+		return []
+
+
+def _infra_cluster_index():
+	"""
+	Builds (and caches in STATE) a spatial index for cluster hulls/centroids/stations to assign cluster_id to points.
+	Returns dict with prepared hulls, centroid KDTree, and station KDTree.
+	"""
+	cache = STATE.get("_infra_cluster_index")
+	ver = int(STATE.get("infrastructure_version") or 0)
+	if isinstance(cache, dict) and cache.get("version") == ver:
+		return cache
+
+	geo = STATE.get("infrastructure_geojson") or {}
+	hulls_fc = (geo.get("cluster_hulls") or {})
+	cent_fc = (geo.get("cluster_centroids") or {})
+	charge_a = (geo.get("charging_type_a") or {})
+	charge_b = (geo.get("charging_type_b") or {})
+
+	# Hulls: list of (cluster_id, prepared_polygon)
+	hulls = []
+	try:
+		for f in (hulls_fc.get("features") or []):
+			p = (f or {}).get("properties") or {}
+			cid = p.get("cluster_id")
+			g = (f or {}).get("geometry")
+			if cid is None or not g:
+				continue
+			poly = shapely_shape(g)
+			if poly is None or getattr(poly, "is_empty", True):
+				continue
+			hulls.append((cid, shapely_prep(poly)))
+	except Exception:
+		hulls = []
+
+	# Centroids KDTree
+	cent_points = []
+	cent_ids = []
+	try:
+		for f in (cent_fc.get("features") or []):
+			p = (f or {}).get("properties") or {}
+			cid = p.get("cluster_id")
+			g = (f or {}).get("geometry") or {}
+			if cid is None or (g.get("type") or "").lower() != "point":
+				continue
+			lon, lat = g.get("coordinates") or [None, None]
+			if lat is None or lon is None:
+				continue
+			cent_points.append([float(lat), float(lon)])
+			cent_ids.append(cid)
+	except Exception:
+		cent_points, cent_ids = [], []
+	cent_tree = cKDTree(np.asarray(cent_points, dtype=float)) if cent_points else None
+
+	# Charging station KDTree (most reliable cluster_id)
+	st_points = []
+	st_ids = []
+	try:
+		for fc in (charge_a, charge_b):
+			for f in (fc.get("features") or []):
+				p = (f or {}).get("properties") or {}
+				cid = p.get("cluster_id")
+				g = (f or {}).get("geometry") or {}
+				if cid is None or (g.get("type") or "").lower() != "point":
+					continue
+				lon, lat = g.get("coordinates") or [None, None]
+				if lat is None or lon is None:
+					continue
+				st_points.append([float(lat), float(lon)])
+				st_ids.append(cid)
+	except Exception:
+		st_points, st_ids = [], []
+	st_tree = cKDTree(np.asarray(st_points, dtype=float)) if st_points else None
+
+	out = {
+		"version": ver,
+		"hulls": hulls,
+		"cent_tree": cent_tree,
+		"cent_ids": cent_ids,
+		"st_tree": st_tree,
+		"st_ids": st_ids,
+		"point_cache": {},
+	}
+	STATE["_infra_cluster_index"] = out
+	return out
+
+
+def _infer_cluster_id_for_point(point: Tuple[float, float]) -> Any:
+	"""Best-effort cluster_id for a WGS84 point (lat, lon). Returns None if unknown."""
+	try:
+		idx = _infra_cluster_index()
+		key = (round(float(point[0]), 6), round(float(point[1]), 6))
+		pc = idx.get("point_cache") or {}
+		if key in pc:
+			return pc[key]
+
+		pt = ShapelyPoint(float(point[1]), float(point[0]))  # (lon, lat)
+		# 1) Inside hull
+		for cid, prepared in (idx.get("hulls") or []):
+			try:
+				if prepared.contains(pt):
+					pc[key] = cid
+					idx["point_cache"] = pc
+					return cid
+			except Exception:
+				continue
+
+		# 2) Nearest station with cluster_id (within ~3km)
+		st_tree = idx.get("st_tree")
+		if st_tree is not None and (idx.get("st_ids") or []):
+			d, i = st_tree.query([float(point[0]), float(point[1])], k=1)
+			i = int(i)
+			if 0 <= i < len(idx["st_ids"]) and float(d) * 111000.0 <= 3000.0:
+				pc[key] = idx["st_ids"][i]
+				idx["point_cache"] = pc
+				return pc[key]
+
+		# 3) Nearest centroid (within ~6km)
+		cent_tree = idx.get("cent_tree")
+		if cent_tree is not None and (idx.get("cent_ids") or []):
+			d, i = cent_tree.query([float(point[0]), float(point[1])], k=1)
+			i = int(i)
+			if 0 <= i < len(idx["cent_ids"]) and float(d) * 111000.0 <= 6000.0:
+				pc[key] = idx["cent_ids"][i]
+				idx["point_cache"] = pc
+				return pc[key]
+
+		pc[key] = None
+		idx["point_cache"] = pc
+		return None
+	except Exception:
+		return None
+
+
+def _infer_cluster_id_for_node(G: nx.Graph, node: Any) -> Any:
+	"""Cache node->cluster_id on infra graph."""
+	try:
+		cache = (G.graph or {}).setdefault("_node_cluster_id", {})
+		if node in cache:
+			return cache[node]
+		pos = (G.nodes[node] or {}).get("pos")
+		if not pos:
+			cache[node] = None
+			return None
+		cid = _infer_cluster_id_for_point(tuple(pos))
+		cache[node] = cid
+		return cid
+	except Exception:
+		return None
+
+
+def plan_infrastructure_strict_layer_route(
+	start_coord: Tuple[float, float],
+	end_coord: Tuple[float, float],
+	drone_type: str,
+	mode: str = "empty",
+) -> Tuple[Optional[List[Any]], Optional[List[Tuple[float, float]]], float, List[Dict[str, Any]]]:
+	"""
+	Strict schema: local/voronoi -> branch -> trunk -> branch -> local, plus off_network legs to endpoints.
+	If cluster_id cannot be inferred, returns failure and caller must fallback.
+	"""
+	G = STATE.get("infrastructure_graph")
+	if G is None or G.number_of_nodes() == 0:
+		return None, None, 0.0, []
+
+	start = (float(start_coord[0]), float(start_coord[1]))
+	end = (float(end_coord[0]), float(end_coord[1]))
+
+	c_start = _infer_cluster_id_for_point(start)
+	c_end = _infer_cluster_id_for_point(end)
+	if c_start is None or c_end is None:
+		return None, None, 0.0, []
+
+	# nearest nodes (limit)
+	start_nodes = [n for n, _d in _infra_graph_nearest_nodes(G, start, MAX_NEAREST_NETWORK_NODES)]
+	end_nodes = [n for n, _d in _infra_graph_nearest_nodes(G, end, MAX_NEAREST_NETWORK_NODES)]
+	if not start_nodes or not end_nodes:
+		return None, None, 0.0, []
+
+	# Filter entry/exit nodes by cluster if possible (prefer same-cluster)
+	start_nodes = [n for n in start_nodes if _infer_cluster_id_for_node(G, n) == c_start] or start_nodes
+	end_nodes = [n for n in end_nodes if _infer_cluster_id_for_node(G, n) == c_end] or end_nodes
+
+	# Build portal sets
+	branch_nodes = set()
+	trunk_nodes = set()
+	for u, v, a in G.edges(data=True):
+		lay = (a or {}).get("layer")
+		if lay == "branch":
+			branch_nodes.add(u); branch_nodes.add(v)
+		elif lay == "trunk":
+			trunk_nodes.add(u); trunk_nodes.add(v)
+
+	# Cluster-filtered portal candidates
+	start_branch = [n for n in branch_nodes if _infer_cluster_id_for_node(G, n) == c_start]
+	end_branch = [n for n in branch_nodes if _infer_cluster_id_for_node(G, n) == c_end]
+	if not start_branch or not end_branch or not trunk_nodes:
+		return None, None, 0.0, []
+
+	# Subgraphs by layer
+	def edge_ok_local(a): return (a.get("layer") in ("local", "voronoi"))
+	def edge_ok_branch(a): return (a.get("layer") == "branch")
+	def edge_ok_trunk(a): return (a.get("layer") == "trunk")
+
+	def sp(src, dst, ok_fn):
+		# shortest_path with a layer filter
+		return nx.shortest_path(
+			G,
+			src,
+			dst,
+			weight=lambda u, v, a: float(a.get("length_m") or a.get("weight") or 1e9) if ok_fn(a or {}) else 1e12,
+		)
+
+	best = None
+	best_len = float("inf")
+
+	# Candidate reduction
+	start_entry_cands = start_nodes[:4]
+	end_exit_cands = end_nodes[:4]
+	start_branch_cands = start_branch[:6]
+	end_branch_cands = end_branch[:6]
+	trunk_cands = list(trunk_nodes)[:10]
+
+	for entry in start_entry_cands:
+		# off-network to entry must be short
+		entry_pos = G.nodes[entry].get("pos")
+		if not entry_pos or haversine_m(start, tuple(entry_pos)) > OFF_NETWORK_MAX_M:
+			continue
+		for exitn in end_exit_cands:
+			exit_pos = G.nodes[exitn].get("pos")
+			if not exit_pos or haversine_m(tuple(exit_pos), end) > OFF_NETWORK_MAX_M:
+				continue
+
+			for sb in start_branch_cands:
+				for eb in end_branch_cands:
+					# pick trunk portals closest to branches (cheap heuristic)
+					for t1 in trunk_cands[:6]:
+						for t2 in trunk_cands[:6]:
+							try:
+								p_local_a = sp(entry, sb, edge_ok_local)
+								p_branch_a = sp(sb, t1, edge_ok_branch)
+								p_trunk = sp(t1, t2, edge_ok_trunk)
+								p_branch_b = sp(t2, eb, edge_ok_branch)
+								p_local_b = sp(eb, exitn, edge_ok_local)
+
+								path_nodes = []
+								for seg in (p_local_a, p_branch_a[1:], p_trunk[1:], p_branch_b[1:], p_local_b[1:]):
+									path_nodes.extend(seg)
+
+								coords = [start]
+								coords.append(tuple(entry_pos))
+								for n in path_nodes:
+									pp = G.nodes[n].get("pos")
+									if not pp:
+										continue
+									ppt = tuple(pp)
+									if coords and coords[-1] == ppt:
+										continue
+									coords.append(ppt)
+								coords.append(tuple(exit_pos))
+								coords.append(end)
+								total_len = _route_length(coords)
+								if total_len < best_len:
+									best_len = total_len
+									best = (path_nodes, coords)
+							except Exception:
+								continue
+
+	if not best:
+		return None, None, 0.0, []
+
+	path_nodes, coords = best
+	segs = _route_segments_from_coords(coords, mode=mode)
+	return path_nodes, coords, float(best_len), segs
+
+
+def _route_segments_from_coords(coords: List[Tuple[float, float]], *, mode: str) -> List[Dict[str, Any]]:
+	"""Build per-edge segments for UI/logic. Uses infra edge attributes when available; else off_network."""
+	if not coords or len(coords) < 2:
+		return []
+	G = STATE.get("infrastructure_graph")
+	segments: List[Dict[str, Any]] = []
+	for i in range(1, len(coords)):
+		a = tuple(coords[i - 1])
+		b = tuple(coords[i])
+		layer = "off_network"
+		echelon = 2
+		if G is not None and G.number_of_edges() > 0:
+			try:
+				n1 = _routing_service._find_nearest_node(G, a)
+				n2 = _routing_service._find_nearest_node(G, b)
+				# Accept edge attribution only if both points are close to graph nodes
+				if n1 is not None and n2 is not None:
+					p1 = G.nodes[n1].get("pos")
+					p2 = G.nodes[n2].get("pos")
+					if p1 and p2:
+						if haversine_m(a, tuple(p1)) <= 45.0 and haversine_m(b, tuple(p2)) <= 45.0 and G.has_edge(n1, n2):
+							ed = G.get_edge_data(n1, n2) or {}
+							layer = ed.get("layer") or layer
+							echelon = int(ed.get("flight_level") or echelon)
+			except Exception:
+				pass
+		length_m = float(haversine_m(a, b))
+		segments.append(
+			{
+				"from": [float(a[0]), float(a[1])],
+				"to": [float(b[0]), float(b[1])],
+				"layer": str(layer),
+				"echelon": int(echelon),
+				"length_m": length_m,
+				"mode": str(mode),
+			}
+		)
+	return segments
+
+
+def plan_infrastructure_preferred_route(
+	start_coord: Tuple[float, float],
+	end_coord: Tuple[float, float],
+	drone_type: str,
+	mode: str = "empty",
+	prefer_network: bool = True,
+) -> Tuple[Optional[List[Any]], Optional[List[Tuple[float, float]]], float, List[Dict[str, Any]]]:
+	"""
+	Sets up network-preferred routing:
+	local/voronoi -> branch -> trunk -> branch -> local, with short off-network legs for pickup/dropoff.
+	Returns (path_nodes, coords, length_m, route_segments). Falls back to None on failure.
+	"""
+	infra_G = STATE.get("infrastructure_graph")
+	if infra_G is None or infra_G.number_of_nodes() == 0 or infra_G.number_of_edges() == 0:
+		return None, None, 0.0, []
+
+	# First try strict layer schema (local->branch->trunk->branch->local) when possible.
+	if prefer_network:
+		pn, co, ln, segs = plan_infrastructure_strict_layer_route(
+			start_coord, end_coord, drone_type, mode=mode
+		)
+		if co and segs:
+			return pn, co, ln, segs
+
+	start_n = normalize_latlon(start_coord, ctx="infra_route.start") or (float(start_coord[0]), float(start_coord[1]))
+	end_n = normalize_latlon(end_coord, ctx="infra_route.end") or (float(end_coord[0]), float(end_coord[1]))
+	start = (float(start_n[0]), float(start_n[1]))
+	end = (float(end_n[0]), float(end_n[1]))
+	if haversine_m(start, end) > 30.0:
+		logger.debug("infra_route: start=%s end=%s", start, end)
+
+	# Candidate entry/exit nodes near start/end
+	start_candidates = _infra_graph_nearest_nodes(infra_G, start, MAX_NEAREST_NETWORK_NODES)
+	end_candidates = _infra_graph_nearest_nodes(infra_G, end, MAX_NEAREST_NETWORK_NODES)
+	if not start_candidates or not end_candidates:
+		logger.debug("infra_route: no entry/exit candidates start=%s end=%s", start, end)
+		return None, None, 0.0, []
+
+	# If start/end are very close to the network, collapse to the nearest single node candidate.
+	start_candidates.sort(key=lambda x: x[1])
+	end_candidates.sort(key=lambda x: x[1])
+
+	# Build pair candidates limited by MAX_ROUTE_CANDIDATES
+	pairs: List[Tuple[Any, Any, float]] = []
+	for sn, sd in start_candidates[:MAX_NEAREST_NETWORK_NODES]:
+		for en, ed in end_candidates[:MAX_NEAREST_NETWORK_NODES]:
+			pairs.append((sn, en, float(sd + ed)))
+	pairs.sort(key=lambda x: x[2])
+	pairs = pairs[:MAX_ROUTE_CANDIDATES]
+
+	# Layer-aware weight function
+	def _edge_weight(u, v, attr: Dict[str, Any]) -> float:
+		try:
+			base = float(attr.get("length_m") or attr.get("weight") or 0.0)
+		except Exception:
+			base = 0.0
+		if base <= 0:
+			base = float(haversine_m(infra_G.nodes[u].get("pos"), infra_G.nodes[v].get("pos")))
+		layer = (attr.get("layer") or "").lower()
+		f = 1.0
+		# Prefer local/voronoi for small-scale, but don't over-penalize
+		if layer in ("voronoi", "local"):
+			f = 1.05
+		elif layer == "branch":
+			f = 1.0
+		elif layer == "trunk":
+			f = 0.85
+		elif layer == "off_network":
+			f = OFF_NETWORK_PENALTY
+		return base * f
+
+	best = None
+	best_score = float("inf")
+
+	for entry_node, exit_node, entry_exit_bias in pairs:
+		try:
+			if entry_node not in infra_G.nodes or exit_node not in infra_G.nodes:
+				continue
+			path_nodes = nx.shortest_path(infra_G, entry_node, exit_node, weight=_edge_weight)
+			if not path_nodes or len(path_nodes) < 1:
+				continue
+
+			# Build full coords: start -> entry -> ... -> exit -> end
+			entry_pos = infra_G.nodes[path_nodes[0]].get("pos")
+			exit_pos = infra_G.nodes[path_nodes[-1]].get("pos")
+			if not entry_pos or not exit_pos:
+				continue
+			entry_pos = tuple(entry_pos)
+			exit_pos = tuple(exit_pos)
+
+			off_a = haversine_m(start, entry_pos)
+			off_b = haversine_m(exit_pos, end)
+
+			# Controlled off-network: too far from network => reject this candidate
+			if off_a > OFF_NETWORK_MAX_M or off_b > OFF_NETWORK_MAX_M:
+				continue
+
+			infra_coords = [tuple(infra_G.nodes[n].get("pos")) for n in path_nodes if infra_G.nodes[n].get("pos")]
+			if not infra_coords:
+				continue
+
+			coords: List[Tuple[float, float]] = [start]
+			# Avoid micro-detours if already on network
+			if off_a > 5.0:
+				coords.append(entry_pos)
+			# Append infra coords (skip duplicates)
+			for p in infra_coords:
+				if coords and coords[-1] == tuple(p):
+					continue
+				coords.append(tuple(p))
+			if off_b > 5.0:
+				if coords[-1] != exit_pos:
+					coords.append(exit_pos)
+				coords.append(end)
+			else:
+				# end is basically at exit node
+				if coords[-1] != end:
+					coords.append(end)
+
+			# Estimate score with penalties
+			total_len = _route_length(coords)
+			off_len = float(off_a + off_b)
+			off_pen = off_len * (OFF_NETWORK_PENALTY - 1.0)
+			long_off_pen = max(0.0, off_len - OFF_NETWORK_LONG_PENALTY_M) * 0.55
+
+			# Echelon change penalty across infra edges
+			prev_fl = None
+			changes = 0
+			for i in range(1, len(path_nodes)):
+				ed = infra_G.get_edge_data(path_nodes[i - 1], path_nodes[i]) or {}
+				fl = ed.get("flight_level")
+				if fl is not None and prev_fl is not None and int(fl) != int(prev_fl):
+					changes += 1
+				if fl is not None:
+					prev_fl = int(fl)
+			ech_pen = float(changes) * ECHELON_CHANGE_PENALTY_M
+
+			score = float(total_len + off_pen + long_off_pen + ech_pen + entry_exit_bias * 0.05)
+			if score < best_score:
+				best_score = score
+				best = (path_nodes, coords, total_len)
+		except Exception:
+			continue
+
+	if not best:
+		return None, None, 0.0, []
+	path_nodes, coords, total_len = best
+	route_segments = _route_segments_from_coords(coords, mode=mode)
+	return path_nodes, coords, float(total_len), route_segments
+
+
+def _extract_station_list_from_fc(fc: Dict[str, Any], *, station_type: str) -> List[Dict[str, Any]]:
+	out: List[Dict[str, Any]] = []
+	if not isinstance(fc, dict) or fc.get("type") != "FeatureCollection":
+		return out
+	for i, f in enumerate(fc.get("features") or []):
+		try:
+			geom = (f or {}).get("geometry") or {}
+			if (geom.get("type") or "").lower() != "point":
+				continue
+			lon, lat = geom.get("coordinates") or [None, None]
+			if lat is None or lon is None:
+				continue
+			props = (f or {}).get("properties") or {}
+			cid = props.get("cluster_id")
+			cap = props.get("cluster_drones_total")
+			# fallback to legacy capacity naming
+			if cap is None:
+				cap = props.get("cluster_drones_capacity")
+			try:
+				cap_i = int(round(float(cap))) if cap is not None else None
+			except Exception:
+				cap_i = None
+			sid = props.get("id") or f"{station_type}_{i}"
+			out.append(
+				{
+					"id": str(sid),
+					"station_type": station_type,
+					"pos": (float(lat), float(lon)),
+					"cluster_id": cid,
+					"capacity": cap_i,
+					"cluster_drones_total": props.get("cluster_drones_total"),
+					"cluster_drones_cargo": props.get("cluster_drones_cargo"),
+					"cluster_drones_monitoring": props.get("cluster_drones_monitoring"),
+					"cluster_drones_service": props.get("cluster_drones_service"),
+					"vertical_echelons_connected": props.get("vertical_echelons_connected"),
+				}
+			)
+		except Exception:
+			continue
+	return out
+
+
+def _gdf_or_list_to_fc(obj: Any) -> Dict[str, Any]:
+	"""Normalize demand_hulls/no_fly_zones-like objects into GeoJSON FeatureCollection."""
+	if obj is None:
+		return {"type": "FeatureCollection", "features": []}
+	if isinstance(obj, dict) and obj.get("type") == "FeatureCollection":
+		return obj
+	# GeoDataFrame-like: prefer to_json if present (avoid hard dependency checks)
+	try:
+		to_json = getattr(obj, "to_json", None)
+		if callable(to_json):
+			return json.loads(to_json())
+	except Exception:
+		pass
+	# Fallback: iterate rows and shapely mapping (works for GeoDataFrame without importing geopandas here)
+	try:
+		from shapely.geometry import mapping
+		import pandas as pd
+		geom_col = getattr(obj, "geometry", None)
+		iterrows = getattr(obj, "iterrows", None)
+		cols = list(getattr(obj, "columns", []) or [])
+		if callable(iterrows) and geom_col is not None and "geometry" in cols:
+			features: List[Dict[str, Any]] = []
+			for _, row in iterrows():
+				geom = getattr(row, "geometry", None)
+				if geom is None or getattr(geom, "is_empty", True):
+					continue
+				props: Dict[str, Any] = {}
+				for col in cols:
+					if col == "geometry":
+						continue
+					val = row[col]
+					try:
+						if pd.isna(val):
+							props[col] = None
+						elif hasattr(val, "item"):
+							props[col] = val.item()
+						else:
+							props[col] = val
+					except Exception:
+						props[col] = str(val)
+				features.append({"type": "Feature", "geometry": mapping(geom), "properties": props})
+			return {"type": "FeatureCollection", "features": features}
+	except Exception:
+		pass
+	return {"type": "FeatureCollection", "features": []}
+
+
+def _round_geojson_coords(obj, precision: int = 6):
+	"""Round float coords in GeoJSON for stable payloads (same idea as app.py)."""
+	if isinstance(obj, dict):
+		return {k: _round_geojson_coords(v, precision) for k, v in obj.items()}
+	if isinstance(obj, list):
+		return [_round_geojson_coords(v, precision) for v in obj]
+	if isinstance(obj, float):
+		return round(obj, precision)
+	return obj
+
+
+def _pipeline_params_app_defaults() -> Dict[str, Any]:
+	"""Must match defaults from app.py get_stations_placement."""
+	p = {
+		"network_type": "drive",
+		"simplify": True,
+		"demand_method": "dbscan",
+		"demand_cell_m": 250.0,
+		"dbscan_eps_m": 180.0,
+		"dbscan_min_samples": 15,
+		"a_by_admin_districts": True,
+		"candidates_per_cluster": 25,
+		"use_all_buildings": False,
+		"voronoi_buildings_per_centroid": 60,
+		"inter_cluster_max_hull_gap_m": 2000.0,
+		"inter_cluster_max_edge_length_m": 2000.0,
+		"voronoi_intra_component_bridge_max_m": 600.0,
+		# Disable forced-per-cluster/per-region explosion (keeps A/B/local sane without empty-hull forced fallback).
+		"force_type_b_per_cluster": False,
+		"force_type_a_per_region": False,
+	}
+	return p
+
+
+def _placement_cache_key(city: str, params: Dict[str, Any]) -> str:
+	"""Same deterministic cache key scheme as app.py (placement_schema must match)."""
+	payload = {
+		"city": (city or "").strip(),
+		"network_type": str(params.get("network_type") or "drive"),
+		"simplify": bool(params.get("simplify", True)),
+		"dbscan_eps_m": float(params.get("dbscan_eps_m", 180.0)),
+		"dbscan_min_samples": int(params.get("dbscan_min_samples", 15)),
+		"buildings_per_centroid": int(params.get("voronoi_buildings_per_centroid", 60)),
+		"inter_cluster_max_hull_gap_m": float(params.get("inter_cluster_max_hull_gap_m", 2000.0)),
+		"inter_cluster_max_edge_length_m": float(params.get("inter_cluster_max_edge_length_m", 2000.0)),
+		"use_all_buildings": bool(params.get("use_all_buildings", False)),
+		"voronoi_intra_bridge_max_m": float(params.get("voronoi_intra_component_bridge_max_m", 600.0)),
+		"cache_buster": int(STATE.get("placement_cache_buster") or 0),
+		"placement_schema": 46,
+	}
+	raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+	digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+	return f"drone_planner:placement:{digest}"
+
+
+def _fc_count(x: Any) -> int:
+	if isinstance(x, dict) and x.get("type") == "FeatureCollection":
+		return len(x.get("features") or [])
+	return 0
+
+
+def _layer_counts(geo: Dict[str, Any]) -> Dict[str, int]:
+	return {
+		"charge_a": _fc_count(geo.get("charging_type_a") or {}),
+		"charge_b": _fc_count(geo.get("charging_type_b") or {}),
+		"maintenance": _fc_count(geo.get("to_stations") or {}),
+		"garages": _fc_count(geo.get("garages") or {}),
+		"trunk": _fc_count(geo.get("trunk") or {}),
+		"branch": _fc_count(geo.get("branch_edges") or {}),
+		"local": _fc_count(geo.get("local_edges") or {}),
+		"voronoi": _fc_count(geo.get("voronoi_edges") or {}),
+		"cluster_hulls": _fc_count(geo.get("cluster_hulls") or {}),
+	}
+
+
+def _pipeline_raw_counts(raw: Any) -> Dict[str, int]:
+	"""Best-effort counts from raw pipeline result (may contain GeoDataFrames)."""
+	if not isinstance(raw, dict):
+		return {}
+	out: Dict[str, int] = {}
+	for k in ("demand", "demand_hulls", "charge_stations", "garages", "to_stations", "trunk_edges", "branch_edges", "local_edges", "voronoi_edges"):
+		v = raw.get(k)
+		try:
+			out[k] = int(len(v)) if v is not None else 0
+		except Exception:
+			out[k] = 0
+	return out
+
+
+def _ensure_infrastructure_build(city: str, *, force: bool = False) -> bool:
+	"""Start build if needed. Returns True if started, False if skipped."""
+	city = (city or "").strip()
+	if not city:
+		return False
+	status = STATE.get("infrastructure_build_status")
+	cur_city = (STATE.get("infrastructure_build_city") or "").strip()
+	if status == "building" and cur_city.lower() == city.lower():
+		logger.info("infra build skipped: already building city=%s", city)
+		return False
+	if (
+		not force
+		and status == "ready"
+		and cur_city.lower() == city.lower()
+		and (STATE.get("infrastructure_version") or 0) > 0
+		and isinstance(STATE.get("infrastructure_geojson"), dict)
+		and STATE["infrastructure_geojson"]
+	):
+		logger.info("infra build skipped: already ready city=%s version=%s", city, STATE.get("infrastructure_version"))
+		return False
+
+	# Force rebuild: clear previous infra artifacts so callers don't read stale data while building.
+	if force:
+		_clear_infrastructure_runtime()
+
+	STATE["infrastructure_build_status"] = "building"
+	STATE["infrastructure_build_city"] = city
+	STATE["infrastructure_build_started_at"] = datetime.utcnow().isoformat()
+	STATE["infrastructure_build_finished_at"] = None
+	STATE["infrastructure_build_last_error"] = None
+	STATE["infrastructure_build_stage"] = "starting"
+	STATE["infrastructure_build_stage_detail"] = None
+	STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+
+	async def _task():
+		try:
+			pp = _pipeline_params_app_defaults()
+			logger.info("infra build start city=%s params=%s", city, pp)
+			STATE["infrastructure_build_stage"] = "run_full_pipeline"
+			STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+			await asyncio.to_thread(rebuild_infrastructure_for_city, city, force=force)
+			STATE["infrastructure_build_status"] = "ready"
+			STATE["infrastructure_build_finished_at"] = datetime.utcnow().isoformat()
+			STATE["infrastructure_build_stage"] = "ready"
+			STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+			logger.info(
+				"infra build done city=%s version=%s counts=%s",
+				city,
+				STATE.get("infrastructure_version"),
+				_layer_counts(STATE.get("infrastructure_geojson") or {}),
+			)
+		except Exception as e:
+			STATE["infrastructure_build_status"] = "error"
+			STATE["infrastructure_build_last_error"] = str(e)
+			STATE["infrastructure_build_finished_at"] = datetime.utcnow().isoformat()
+			STATE["infrastructure_build_stage"] = "error"
+			STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+			logger.exception("infra build failed city=%s", city)
+
+	asyncio.create_task(_task())
+	return True
+
+
+def _clear_infrastructure_runtime() -> None:
+	STATE["infrastructure"] = None
+	STATE["infrastructure_geojson"] = None
+	STATE["infrastructure_graph"] = None
+	STATE["infrastructure_version"] = 0
+	STATE["infrastructure_raw_counts"] = {}
+	STATE["infrastructure_pipeline_params"] = {}
+	STATE["infrastructure_build_stage"] = None
+	STATE["infrastructure_build_stage_detail"] = None
+	STATE["infrastructure_build_stage_ts"] = None
+	STATE.pop("_infra_cluster_index", None)
+	try:
+		G = STATE.get("infrastructure_graph")
+		if G is not None and getattr(G, "graph", None) is not None:
+			G.graph.pop("_infra_node_kdtree", None)
+	except Exception:
+		pass
+
+
+def rebuild_infrastructure_for_city(city: str, *, force: bool = False) -> None:
+	"""
+	Build infrastructure for the given city using the same pipeline as app.py,
+	store it into STATE, and update legacy `stations` for backward-compatible charging logic.
+	"""
+	city = (city or "").strip()
+	if not city:
+		raise ValueError("city is required")
+
+	pp = _pipeline_params_app_defaults()
+	STATE["infrastructure_pipeline_params"] = dict(pp)
+	redis_client = None
+	try:
+		redis_client = _infra_data_service.get_redis_client()
+	except Exception:
+		redis_client = None
+
+	cache_key = _placement_cache_key(city, pp)
+	if redis_client is not None and not force:
+		try:
+			cached = redis_client.get(cache_key)
+			if cached:
+				geo = json.loads(cached.decode("utf-8") if isinstance(cached, (bytes, bytearray)) else cached)
+				# ensure rounding-compatible payload
+				geo = _round_geojson_coords(geo, precision=6)
+				# keep cluster hulls if present in cached payload
+				raw = {"demand_hulls": None}  # for infra normalization only
+				logger.info("infra placement loaded from Redis cache key=%s", cache_key)
+			else:
+				geo = None
+		except Exception:
+			geo = None
+	else:
+		geo = None
+
+	if geo is None:
+		# Attach best-effort progress callback for stage hints
+		try:
+			def _cb(stage: str, pct: int, message: str):
+				STATE["infrastructure_build_stage"] = str(stage)
+				STATE["infrastructure_build_stage_detail"] = f"{int(pct)}% {message}"
+				STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+			if hasattr(_infra_data_service, "progress_callbacks"):
+				cbs = getattr(_infra_data_service, "progress_callbacks") or []
+				if _cb not in cbs:
+					cbs.append(_cb)
+					_infra_data_service.progress_callbacks = cbs
+		except Exception:
+			pass
+		STATE["infrastructure_build_stage"] = "run_full_pipeline"
+		STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+		raw = run_full_pipeline(_infra_data_service, city, force_refresh=bool(force), **pp)
+		STATE["infrastructure_raw_counts"] = _pipeline_raw_counts(raw)
+		STATE["infrastructure_build_stage"] = "pipeline_result_to_geojson"
+		STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+		geo = pipeline_result_to_geojson(raw)
+		geo = _round_geojson_coords(geo, precision=6)
+		STATE["infrastructure_build_stage"] = "add_cluster_hulls"
+		STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+		# Добавляем только cluster_hulls (в app.py оно выдаётся отдельным эндпоинтом /api/buildings/clusters)
+		cluster_hulls_fc = _gdf_or_list_to_fc(raw.get("demand_hulls"))
+		geo["cluster_hulls"] = _round_geojson_coords(cluster_hulls_fc, precision=6)
+		# Voronoi fallback: if placement didn't include voronoi_edges (shouldn't, but happens on some cities),
+		# compute it exactly like app.py endpoint /api/buildings/voronoi-local-paths.
+		if _fc_count(geo.get("voronoi_edges") or {}) == 0:
+			STATE["infrastructure_build_stage"] = "build_voronoi_local_paths_fc"
+			STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+			try:
+				vfc = build_voronoi_local_paths_fc(
+					_infra_data_service,
+					city=city,
+					network_type=str(pp.get("network_type") or "drive"),
+					simplify=bool(pp.get("simplify", True)),
+					dbscan_eps_m=float(pp.get("dbscan_eps_m", 180.0)),
+					dbscan_min_samples=int(pp.get("dbscan_min_samples", 15)),
+					use_all_buildings=bool(pp.get("use_all_buildings", False)),
+					buildings_per_centroid=int(pp.get("voronoi_buildings_per_centroid", 60)),
+					inter_cluster_max_hull_gap_m=float(pp.get("inter_cluster_max_hull_gap_m", 2000.0)),
+					inter_cluster_max_edge_length_m=float(pp.get("inter_cluster_max_edge_length_m", 2000.0)),
+					voronoi_intra_component_bridge_max_m=float(pp.get("voronoi_intra_component_bridge_max_m", 600.0)),
+				)
+				geo["voronoi_edges"] = _round_geojson_coords(vfc, precision=6)
+			except Exception:
+				pass
+	else:
+		STATE["infrastructure_raw_counts"] = {}
+		# Save in Redis for parity with app.py behaviour
+		if redis_client is not None:
+			try:
+				redis_client.set(cache_key, json.dumps(geo, ensure_ascii=False).encode("utf-8"))
+				logger.info("infra placement saved to Redis cache key=%s", cache_key)
+			except Exception:
+				logger.warning("infra placement failed to save to Redis")
+
+	charging_a = geo.get("charging_type_a") or {"type": "FeatureCollection", "features": []}
+	charging_b = geo.get("charging_type_b") or {"type": "FeatureCollection", "features": []}
+	charging_stations = _extract_station_list_from_fc(charging_a, station_type="charge_a") + _extract_station_list_from_fc(
+		charging_b, station_type="charge_b"
+	)
+
+	infra = {
+		"charging_stations": charging_stations,
+		"maintenance_stations": geo.get("to_stations"),
+		"garages": geo.get("garages"),
+		"trunk_paths": geo.get("trunk"),
+		"branch_paths": geo.get("branch_edges"),
+		"local_paths": geo.get("voronoi_edges"),
+		"clusters": {
+			"centroids": geo.get("cluster_centroids"),
+			"hulls": geo.get("cluster_hulls"),
+		},
+		"flight_levels": geo.get("flight_levels") or [],
+	}
+	# Keep raw separately (not JSON-serializable; avoid breaking /api/infrastructure)
+	STATE["infrastructure_raw"] = raw
+
+	# Build graph for routing.
+	STATE["infrastructure_build_stage"] = "build_infrastructure_graph"
+	STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+	infra_graph = build_infrastructure_graph(geo)
+
+	# Update STATE atomically-ish.
+	STATE["infrastructure"] = infra
+	STATE["infrastructure_geojson"] = geo
+	STATE["infrastructure_graph"] = infra_graph
+	STATE["infrastructure_version"] = int(STATE.get("infrastructure_version") or 0) + 1
+	# reset cluster index cache
+	STATE.pop("_infra_cluster_index", None)
+
+	# Backward-compat: legacy chargers list is `STATE["stations"]` as (lat, lon)
+	legacy_stations: List[Tuple[float, float]] = []
+	for st in charging_stations:
+		pos = st.get("pos")
+		if isinstance(pos, (list, tuple)) and len(pos) == 2:
+			legacy_stations.append((float(pos[0]), float(pos[1])))
+	STATE["stations"] = legacy_stations
+	STATE["station_queues"] = {
+		str(i): {
+			"charged_batteries": STATION_CHARGED_BATTERIES_MAX,
+			"charging_queue": [],
+			"queue": [],
+		}
+		for i in range(len(legacy_stations))
+	}
+	# IMPORTANT: refresh charger_nodes after BOTH infrastructure_graph and stations are updated,
+	# so charging logic binds to the current city_graph with the latest station list.
+	try:
+		refresh_charger_nodes()
+	except Exception:
+		logger.exception("refresh_charger_nodes after infra rebuild failed")
+	# (Re)spawn drones from infrastructure capacity (no artificial caps).
+	# Replace base-inventory spawn (50) once infra charging stations are available.
+	try:
+		STATE["infrastructure_build_stage"] = "spawn_drones"
+		STATE["infrastructure_build_stage_ts"] = datetime.utcnow().isoformat()
+		_spawn_drones_from_infra_if_ready(force=force)
+	except Exception:
+		logger.exception("spawn drones after infra failed")
+
+
+def _spawn_drones_from_infra_if_ready(*, force: bool = False) -> None:
+	infra = STATE.get("infrastructure") or {}
+	charging = (infra.get("charging_stations") or []) if isinstance(infra, dict) else []
+	if not charging:
+		# fallback: at least ensure base drones exist
+		ensure_base_drones()
+		return
+	drones = STATE.get("drones") or {}
+	all_idle = all((d or {}).get("status") in (None, "idle") for d in drones.values())
+	all_from_base = drones and all((d or {}).get("home_station_id") == "base" for d in drones.values())
+	if force or not drones or (all_idle and all_from_base):
+		STATE["drones"] = {}
+		ensure_base_drones()
+		by_type = {"cargo": 0, "operator": 0, "cleaner": 0}
+		for _id, d in (STATE.get("drones") or {}).items():
+			t = (d or {}).get("type")
+			if t in by_type:
+				by_type[t] += 1
+		logger.info(
+			"spawn_drones stations=%s total=%s cargo=%s operator=%s cleaner=%s",
+			len(charging),
+			len(STATE.get("drones") or {}),
+			by_type["cargo"],
+			by_type["operator"],
+			by_type["cleaner"],
+		)
 
 
 # Utilities
 async def resolve_point(coords: Optional[List[float]], address: Optional[str]):
+	def _normalize_latlon_pair(pair: Tuple[float, float]) -> Tuple[float, float]:
+		lat, lon = float(pair[0]), float(pair[1])
+		# Heuristic: choose orientation closer to Balakovo center when city is Balakovo-like
+		city = (STATE.get("city") or "").lower()
+		if "balakovo" in city:
+			c0 = (52.0278, 47.8007)
+			d1 = haversine_m((lat, lon), c0)
+			d2 = haversine_m((lon, lat), c0)
+			if d2 + 10.0 < d1:
+				logger.warning("coords look swapped for Balakovo: %s -> swapped", (lat, lon))
+				return (lon, lat)
+		# Generic bounds swap: if lat outside [-90,90] but lon inside, swap
+		if abs(lat) > 90 and abs(lon) <= 90:
+			logger.warning("coords lat out of range: swapping %s", (lat, lon))
+			return (lon, lat)
+		return (lat, lon)
+
 	if coords and len(coords) == 2:
-		return tuple(coords)
+		try:
+			return _normalize_latlon_pair((float(coords[0]), float(coords[1])))
+		except Exception:
+			return tuple(coords)
 	if address:
 		try:
 			city = STATE["city"]
-			return _data_service.address_to_coords(address, city)
+			out = _data_service.address_to_coords(address, city)
+			if out and isinstance(out, (list, tuple)) and len(out) == 2:
+				return _normalize_latlon_pair((float(out[0]), float(out[1])))
+			return out
 		except Exception:
 			return None
 	return None
@@ -1152,13 +2546,13 @@ def plan_operator_point_trip(
 	Маршрут операторского/сервисного дрона до точки: дрон → точка → зарядка.
 	Оба сегмента в режиме MODE_EMPTY, с возможными остановками на зарядку.
 	"""
-	G = STATE.get("city_graph")
+	G = get_active_routing_graph()
 	city = STATE.get("city")
 	if not city or G is None:
 		return {"ok": False, "reason": "no graph", "details": "no city graph"}
 	_routing_service.set_battery_mode(STATE.get("battery_mode", "reality"))
 	_routing_service.city_graphs[city] = G
-	charger_nodes = STATE.get("charger_nodes") or {"base": None, "stations": []}
+	charger_nodes = limited_charger_nodes(drone_pos)
 	plan_reserve = PLAN_RESERVE_PCT_TEST if STATE.get("battery_mode") == "test" else PLAN_RESERVE_PCT
 	start_node = _routing_service._find_nearest_node(G, drone_pos)
 	point_node = _routing_service._find_nearest_node(G, point)
@@ -1198,9 +2592,11 @@ def plan_operator_point_trip(
 	total_length = len_a + len_c
 	chargers_used = list(dict.fromkeys(chargers_a + chargers_c))
 	battery_after_escape = 100.0 if chargers_c else _routing_service.compute_battery_after(len_c, battery_after_a, MODE_EMPTY, drone_type)
+	route_segments = _route_segments_from_coords(full_coords, mode="empty")
 	return {
 		"ok": True,
 		"coords": full_coords,
+		"route_segments": route_segments,
 		"segments": [
 			{"type": "to_point", "coords": coords_a, "length": len_a, "chargers": chargers_a},
 			{"type": "escape", "coords": coords_c or [], "length": len_c, "chargers": chargers_c},
@@ -1258,6 +2654,7 @@ async def assign_orders():
 	if not city or G is None:
 		return
 	queue = [o for o in STATE["orders"] if o.get("status") == "queued"]
+	logger.info("assign_orders start queued=%s", len(queue))
 	# Сортируем по приоритету (убывание), при равном — по порядку в списке (FIFO)
 	order_indices = {o.get("id"): i for i, o in enumerate(STATE["orders"])}
 	queue = sorted(queue, key=lambda o: (-o.get("priority", 0), order_indices.get(o.get("id"), 0)))
@@ -1265,6 +2662,7 @@ async def assign_orders():
 		required_type = order.get("drone_type") or map_order_to_drone_type(order.get("type", "delivery"))
 		drone_id = pick_drone_for_order(order, required_type)
 		if drone_id is None:
+			order["last_error"] = "NO_VALID_DRONE"
 			continue
 		drone = STATE["drones"][drone_id]
 		continuation = None
@@ -1312,8 +2710,43 @@ async def assign_orders():
 				order.get("id"), drone_id, result.get("reason"), result.get("details")
 			)
 			continue
+		full_coords = result.get("coords") or []
+		segs = result.get("route_segments") or []
+		route_len = float(result.get("route_length") or 0.0)
+		valid_reason = "ok"
+		if not full_coords or len(full_coords) <= 1:
+			valid_reason = "invalid_waypoints"
+		elif route_len <= 1.0:
+			valid_reason = "invalid_route_len"
+		elif haversine_m(tuple(order["start"]), tuple(order["end"])) > 30.0 and int(result.get("pickup_waypoint_count") or 0) <= 1:
+			valid_reason = "invalid_pickup_waypoints"
+		# Ensure segments exist for UI/telemetry
+		if valid_reason == "ok" and (not isinstance(segs, list) or len(segs) == 0) and len(full_coords) >= 2:
+			segs = _route_segments_from_coords([tuple(p) for p in full_coords], mode="empty")
+			result["route_segments"] = segs
+		if valid_reason != "ok":
+			logger.info(
+				"assign_orders route validation: order_id=%s drone_id=%s route_len=%.1f waypoints=%s segments=%s valid=false reason=%s",
+				order.get("id"),
+				drone_id,
+				route_len,
+				len(full_coords) if isinstance(full_coords, list) else 0,
+				len(segs) if isinstance(segs, list) else 0,
+				valid_reason,
+			)
+			order["status"] = "queued"
+			order["last_plan_error"] = str(valid_reason)
+			continue
+		logger.info(
+			"assign_orders route validation: order_id=%s drone_id=%s route_len=%.1f waypoints=%s segments=%s valid=true",
+			order.get("id"),
+			drone_id,
+			route_len,
+			len(full_coords) if isinstance(full_coords, list) else 0,
+			len(segs) if isinstance(segs, list) else 0,
+		)
 		full_coords = result["coords"]
-		apply_midroute_charging(drone, full_coords)
+		apply_midroute_charging(drone, full_coords, full_segments=result.get("route_segments"))
 		chargers_used = result.get("chargers_used", [])
 		pickup_wp = result.get("pickup_waypoint_count", len(full_coords))
 		logger.info(
@@ -1344,6 +2777,8 @@ async def assign_orders():
 		order["chargers_used"] = result.get("chargers_used", [])
 		order["battery_plan"] = result.get("battery_plan", [])
 		order["segments"] = result.get("segments", [])
+		# Route segments for UI (do not embed into infrastructure geojson)
+		drone["route_segments"] = list(drone.get("route_segments") or [])
 		drone["loaded_after_waypoint_count"] = pickup_wp
 		drone["waypoints_completed"] = 0
 		drone["active_order_id"] = order.get("id")
@@ -1361,6 +2796,9 @@ def _order_completion_time_seconds(result: Dict[str, Any]) -> float:
 	if not result or not result.get("ok"):
 		return float("inf")
 	route_m = float(result.get("route_length", 0))
+	# Reject "zero route" unless explicitly allowed
+	if route_m <= 1.0:
+		return float("inf")
 	chargers = result.get("chargers_used") or []
 	speed = _estimate_speed_mps()
 	flight_sec = route_m / speed if speed > 0 else 0
@@ -1436,6 +2874,7 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 
 	best_drone_id = None
 	best_time = float("inf")
+	debug_rows = []
 
 	for drone_id, d in STATE["drones"].items():
 		if d.get("type") != required_drone_type:
@@ -1444,8 +2883,23 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 			continue
 		if not d.get("pos"):
 			continue
-		time_sec, _ = estimate_order_completion_time_seconds(d, order, required_drone_type)
-		if time_sec < best_time:
+		pos = tuple(d.get("pos"))
+		dd = haversine_m(pos, tuple(order_start))
+		time_sec, res = estimate_order_completion_time_seconds(d, order, required_drone_type)
+		route_len = float(res.get("route_length", 0.0)) if res else 0.0
+		valid = (time_sec != float("inf") and route_len > 1.0)
+		reason = "ok" if valid else ("no_route" if not res or not res.get("ok") else "zero_or_inf")
+		debug_rows.append({
+			"drone_id": drone_id,
+			"drone_pos": pos,
+			"pickup": tuple(order_start),
+			"distance_direct_m": float(dd),
+			"route_len_m": float(route_len),
+			"eta_s": float(time_sec) if time_sec != float("inf") else None,
+			"valid": bool(valid),
+			"reason": reason,
+		})
+		if valid and time_sec < best_time:
 			best_time = time_sec
 			best_drone_id = drone_id
 
@@ -1470,6 +2924,14 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 					order.get("id"), new_id, time_new, existing_best,
 				)
 				return new_id
+
+	STATE["last_route_debug"] = {
+		"ts": datetime.utcnow().isoformat(),
+		"order_id": order.get("id"),
+		"required_type": required_drone_type,
+		"candidates": sorted(debug_rows, key=lambda r: (r["valid"] is False, r["eta_s"] if r["eta_s"] is not None else 1e18, r["distance_direct_m"]))[:30],
+	}
+	logger.info("pick_drone candidates count=%s valid=%s", len(debug_rows), sum(1 for r in debug_rows if r.get("valid")))
 
 	if best_drone_id is not None:
 		logger.info(
@@ -1498,25 +2960,39 @@ def plan_route_for(
 ):
 	"""reserve_pct: при None используется RESERVE_PCT; при 0 — весь заряд на путь (для экстренного вылета на зарядку)."""
 	city = STATE.get("city")
-	G = STATE.get("city_graph")
-	if not city or G is None:
+	city_G = STATE.get("city_graph")
+	if not city or city_G is None:
 		return None, None, 0.0
-	_routing_service.city_graphs[city] = G
+	_routing_service.city_graphs[city] = city_G
 	res = reserve_pct if reserve_pct is not None else RESERVE_PCT
 	max_range = _routing_service.max_reachable_distance(battery_level, MODE_EMPTY, drone_type, reserve_pct=res)
-	path, coords, length = _routing_service.plan_direct_path(G, start, end, max_range, waypoints=waypoints)
-	if path:
+	# 1) If infra is ready, try infra routing FIRST (only for simple A->B without waypoints).
+	if is_infrastructure_routing_ready() and not waypoints:
+		_pn, coords_infra, length_infra, segs = plan_infrastructure_preferred_route(
+			start, end, drone_type, mode="empty", prefer_network=True
+		)
+		if coords_infra and len(coords_infra) > 1 and float(length_infra) > 1.0 and segs:
+			logger.info("plan_route_for: mode=%s len=%.1f pts=%s", "infra_route", float(length_infra), len(coords_infra))
+			return None, coords_infra, float(length_infra)
+
+	# 2) City door-to-door fallback (MUST use city_graph, never infra_graph).
+	path, coords, length = _routing_service.plan_direct_path(city_G, start, end, max_range, waypoints=waypoints)
+	if path and coords and len(coords) > 1 and float(length) > 1.0:
+		logger.info("plan_route_for: mode=%s len=%.1f pts=%s", "city_fallback", float(length), len(coords))
 		return path, coords, length
-	# fallback to node-to-node
-	start_node = _routing_service._find_nearest_node(G, start)
-	end_node = _routing_service._find_nearest_node(G, end)
+
+	# 3) City node-to-node last resort
+	start_node = _routing_service._find_nearest_node(city_G, start)
+	end_node = _routing_service._find_nearest_node(city_G, end)
 	if not start_node or not end_node:
 		return None, None, 0.0
-	path = _routing_service._find_safe_path(G, start_node, end_node, max_range)
+	path = _routing_service._find_safe_path(city_G, start_node, end_node, max_range)
 	if not path:
 		return None, None, 0.0
-	coords = [G.nodes[n]['pos'] for n in path]
-	length = _routing_service._calculate_path_length(G, path)
+	coords = [city_G.nodes[n]['pos'] for n in path]
+	length = _routing_service._calculate_path_length(city_G, path)
+	if coords and len(coords) > 1 and float(length) > 1.0:
+		logger.info("plan_route_for: mode=%s len=%.1f pts=%s", "city_fallback", float(length), len(coords))
 	return path, coords, length
 
 
@@ -1640,10 +3116,84 @@ def plan_order_trip(
 	city = STATE.get("city")
 	if not city or G is None:
 		return {"ok": False, "reason": NO_PATH_TO_PICKUP, "details": "no city graph"}
+
+	logger.info(
+		"plan_order_trip: graphs city_graph=%s infra_ready=%s",
+		"ok" if (G is not None and getattr(G, "number_of_edges", lambda: 0)() > 0) else "missing",
+		bool(is_infrastructure_routing_ready()),
+	)
+
+	# Optional infra-preferred A+B (no chargers/waypoints); if fails, fall back to city_graph logic.
+	if is_infrastructure_routing_ready():
+		try:
+			max_a = _routing_service.max_reachable_distance(battery_pct, MODE_EMPTY, drone_type, reserve_pct=PLAN_RESERVE_PCT)
+			_pna, coords_a_i, len_a_i, segs_a_i = plan_infrastructure_preferred_route(
+				drone_pos, pickup, drone_type, mode="empty", prefer_network=True
+			)
+			if coords_a_i and len(coords_a_i) > 1 and float(len_a_i) > 1.0 and segs_a_i and float(len_a_i) <= float(max_a):
+				battery_after_a_i = _routing_service.compute_battery_after(float(len_a_i), battery_pct, MODE_EMPTY, drone_type)
+				max_b = _routing_service.max_reachable_distance(battery_after_a_i, MODE_LOADED, drone_type, reserve_pct=PLAN_RESERVE_PCT)
+				_pnb, coords_b_i, len_b_i, segs_b_i = plan_infrastructure_preferred_route(
+					pickup, dropoff, drone_type, mode="loaded", prefer_network=True
+				)
+				if coords_b_i and len(coords_b_i) > 1 and float(len_b_i) > 1.0 and segs_b_i and float(len_b_i) <= float(max_b):
+					full_coords = list(coords_a_i) + list(coords_b_i[1:])
+					# Merge infra segments and enforce mode switch at pickup
+					route_segments = list(segs_a_i) + list(segs_b_i)
+					for seg in route_segments[len(segs_a_i):]:
+						seg["mode"] = "loaded"
+					total_length = float(len_a_i) + float(len_b_i)
+					if total_length > 1.0 and len(full_coords) > 1:
+						logger.info("plan_order_trip: mode=%s len=%.1f pts=%s", "infra_route", total_length, len(full_coords))
+						return {
+							"ok": True,
+							"coords": full_coords,
+							"route_segments": route_segments,
+							"segments": [],
+							"chargers_used": [],
+							"battery_plan": [],
+							"pickup_waypoint_count": len(coords_a_i),
+							"route_length": total_length,
+						}
+		except Exception:
+			# infra route must never break orders; fall back below
+			logger.exception("plan_order_trip: infra_route failed, falling back to city_graph")
+
+	# Primary (while infra is unstable): door-to-door city_graph plan.
+	try:
+		max_a = _routing_service.max_reachable_distance(battery_pct, MODE_EMPTY, drone_type, reserve_pct=PLAN_RESERVE_PCT)
+		_pa, ca, la = _routing_service.plan_direct_path(G, drone_pos, pickup, max_a)
+		if ca and len(ca) > 1:
+			battery_after_a = _routing_service.compute_battery_after(la, battery_pct, MODE_EMPTY, drone_type)
+			max_b = _routing_service.max_reachable_distance(battery_after_a, MODE_LOADED, drone_type, reserve_pct=PLAN_RESERVE_PCT)
+			_pb, cb, lb = _routing_service.plan_direct_path(G, pickup, dropoff, max_b)
+			if cb and len(cb) > 1:
+				full_coords = list(ca) + list(cb[1:])
+				route_segments = _route_segments_from_coords([tuple(p) for p in full_coords], mode="empty")
+				total_length = float(la) + float(lb)
+				logger.info("plan_order_trip: mode=%s len=%.1f pts=%s segs=%s", "city_fallback", total_length, len(full_coords), len(route_segments))
+				return {
+					"ok": True,
+					"coords": full_coords,
+					"route_segments": route_segments,
+					"segments": [],
+					"chargers_used": [],
+					"battery_plan": [],
+					"pickup_waypoint_count": len(ca),
+					"route_length": total_length,
+				}
+	except Exception:
+		pass
+	# Guard: if pickup/dropoff are different but planning degenerates to zero, reject later.
+	try:
+		if haversine_m(tuple(pickup), tuple(dropoff)) > 30.0:
+			pass
+	except Exception:
+		pass
 	# Всегда синхронизируем режим батареи из STATE, чтобы тест/реальность применялись при планировании
 	_routing_service.set_battery_mode(STATE.get("battery_mode", "reality"))
 	_routing_service.city_graphs[city] = G
-	charger_nodes = STATE.get("charger_nodes") or {"base": None, "stations": []}
+	charger_nodes = limited_charger_nodes(drone_pos)
 	# В тесте — большой запас; для грузового — после доставки оставляем 20%
 	plan_reserve = PLAN_RESERVE_PCT_TEST if STATE.get("battery_mode") == "test" else PLAN_RESERVE_PCT
 	if drone_type == "cargo":
@@ -1656,7 +3206,37 @@ def plan_order_trip(
 		logger.warning("plan_order_trip: missing node start=%s pickup=%s dropoff=%s", start_node, pickup_node, dropoff_node)
 		return {"ok": False, "reason": NO_PATH_TO_PICKUP, "details": "nearest node not found"}
 
+	# While infrastructure is building (and legacy stations are empty), allow a pure city-graph plan
+	# without multi-charger constraints. This keeps orders flying instead of getting stuck queued.
+	try:
+		if STATE.get("infrastructure_build_status") != "ready" and not (charger_nodes.get("stations") or []):
+			max_a = _routing_service.max_reachable_distance(battery_pct, MODE_EMPTY, drone_type, reserve_pct=plan_reserve)
+			_pa, ca, la = _routing_service.plan_direct_path(G, drone_pos, pickup, max_a)
+			if not ca or len(ca) < 2:
+				return {"ok": False, "reason": NO_PATH_TO_PICKUP, "details": "city_graph direct path to pickup failed"}
+			battery_after_a_direct = _routing_service.compute_battery_after(la, battery_pct, MODE_EMPTY, drone_type)
+			max_b = _routing_service.max_reachable_distance(battery_after_a_direct, MODE_LOADED, drone_type, reserve_pct=plan_reserve)
+			_pb, cb, lb = _routing_service.plan_direct_path(G, pickup, dropoff, max_b)
+			if not cb or len(cb) < 2:
+				return {"ok": False, "reason": NO_FEASIBLE_CHAIN_PICKUP_TO_DROPOFF_LOADED, "details": "city_graph direct path pickup->dropoff failed"}
+			full_coords = list(ca) + list(cb[1:])
+			route_segments = _route_segments_from_coords([tuple(p) for p in full_coords], mode="empty")
+			total_length = float(la) + float(lb)
+			return {
+				"ok": True,
+				"coords": full_coords,
+				"route_segments": route_segments,
+				"segments": [],
+				"chargers_used": [],
+				"battery_plan": [],
+				"pickup_waypoint_count": len(ca),
+				"route_length": total_length,
+			}
+	except Exception:
+		pass
+
 	# Попытка без предварительной зарядки; для грузового проверяем, что после доставки остаётся >= 20%
+	logger.info("plan_order_trip: stage=%s graph=%s", "A_to_pickup", "city_graph")
 	path_a, coords_a, len_a, chargers_a = _routing_service.plan_with_chargers(
 		G, start_node, pickup_node, battery_pct, MODE_EMPTY, drone_type, reserve_pct=plan_reserve, charger_nodes=charger_nodes,
 		max_segment_battery_pct=MAX_SEGMENT_BATTERY_PCT, max_battery_pct_to_reach_charger=MAX_BATTERY_PCT_TO_REACH_CHARGER,
@@ -1676,6 +3256,7 @@ def plan_order_trip(
 		battery_after_a = 100.0
 
 	# Stage B: pickup -> dropoff (loaded); для грузового после доставки должно остаться >= 20%
+	logger.info("plan_order_trip: stage=%s graph=%s", "B_to_dropoff", "city_graph")
 	path_b, coords_b, len_b, chargers_b = _routing_service.plan_with_chargers(
 		G, pickup_node, dropoff_node, battery_after_a, MODE_LOADED, drone_type, reserve_pct=plan_reserve, charger_nodes=charger_nodes,
 		max_segment_battery_pct=MAX_SEGMENT_BATTERY_PCT, max_battery_pct_to_reach_charger=MAX_BATTERY_PCT_TO_REACH_CHARGER,
@@ -1701,6 +3282,7 @@ def plan_order_trip(
 		return {"ok": False, "reason": NO_FEASIBLE_CHAIN_PICKUP_TO_DROPOFF_LOADED, "details": "insufficient battery after delivery (need 20%% reserve)"}
 
 	# Stage C: dropoff -> any charger (escape)
+	logger.info("plan_order_trip: stage=%s graph=%s", "C_escape", "city_graph")
 	path_c, coords_c, len_c, chargers_c = None, None, 0.0, []
 	base_node = charger_nodes.get("base")
 	station_nodes = charger_nodes.get("stations") or []
@@ -1717,8 +3299,9 @@ def plan_order_trip(
 			best_len_c = l_c
 			best_c = (p_c, co_c, l_c, ch_c)
 	if not best_c:
-		if not base_node and not any(station_nodes):
-			# No chargers defined — plan is still valid, no escape segment
+		# If there are no stations configured yet (infra is building), do not block the order.
+		# We'll allow finishing at dropoff without an "escape to charger" segment.
+		if not any(station_nodes):
 			path_c, coords_c, len_c, chargers_c = [], [], 0.0, []
 		else:
 			logger.info("plan_order_trip: no escape after dropoff battery_after_b=%.1f", battery_after_b)
@@ -1732,6 +3315,24 @@ def plan_order_trip(
 	if coords_c:
 		full_coords.extend(coords_c[1:])
 	pickup_waypoint_count = len(coords_a)
+
+	# Build route_segments with mode switch after pickup
+	route_segments: List[Dict[str, Any]] = []
+	try:
+		segs_all = _route_segments_from_coords(full_coords, mode="empty")
+		# segments index i corresponds to coords[i] -> coords[i+1]
+		for si, seg in enumerate(segs_all):
+			# before pickup: empty; from pickup onwards: loaded until dropoff; then empty for escape
+			# pickup point is coords[pickup_waypoint_count-1]
+			# dropoff point is end of coords_b (coords_a + coords_b[1:]) => idx_dropoff = pickup_waypoint_count + (len(coords_b)-1) - 1
+			dropoff_coord_idx = max(0, pickup_waypoint_count + max(0, len(coords_b or []) - 1) - 1)
+			mode_here = "empty"
+			if si >= max(0, pickup_waypoint_count - 1) and si < dropoff_coord_idx:
+				mode_here = "loaded"
+			seg["mode"] = mode_here
+			route_segments.append(seg)
+	except Exception:
+		route_segments = _route_segments_from_coords(full_coords, mode="empty")
 
 	segments = [
 		{"type": "to_pickup", "coords": coords_a, "length": len_a, "chargers": chargers_a},
@@ -1747,10 +3348,13 @@ def plan_order_trip(
 		{"at": "after_escape", "battery": battery_after_escape},
 	]
 	total_length = len_a + len_b + len_c
+	if total_length <= 1.0 and haversine_m(tuple(pickup), tuple(dropoff)) > 30.0:
+		return {"ok": False, "reason": "ZERO_ROUTE", "details": "route_length=0 for distinct pickup/dropoff"}
 
 	return {
 		"ok": True,
 		"coords": full_coords,
+		"route_segments": route_segments,
 		"segments": segments,
 		"chargers_used": chargers_used,
 		"battery_plan": battery_plan,
@@ -1782,12 +3386,20 @@ def can_escape_after(point: Tuple[float, float], drone_type: str) -> bool:
 	G = STATE.get("city_graph")
 	if G is None:
 		return True
+	# While infrastructure is building (and legacy stations may be empty),
+	# do not hard-block orders by "escape" feasibility.
+	if STATE.get("infrastructure_build_status") in ("building", "idle", "error"):
+		return True
 	charger_nodes = STATE.get("charger_nodes") or {"base": None, "stations": []}
 	point_node = _routing_service._find_nearest_node(G, point)
+	# If we cannot bind to the graph, don't hard-block the order — let fallback routing decide.
 	if not point_node:
-		return False
+		return True
 	base_node = charger_nodes.get("base")
 	stations = charger_nodes.get("stations") or []
+	if not base_node and not any(stations):
+		# No chargers configured yet (infra building and legacy stations empty) — do not block.
+		return True
 	for goal in [base_node] + [s for s in stations if s]:
 		if goal is None or goal not in G.nodes:
 			continue
@@ -1803,7 +3415,7 @@ def simulate_step():
 	# move drones along their routes, drain battery, reroute if blocked and avoid collisions
 	_routing_service.set_battery_mode(STATE.get("battery_mode", "reality"))
 	city = STATE.get("city")
-	G = STATE.get("city_graph")
+	G = get_active_routing_graph()
 	if not city or G is None:
 		return
 	for drone_id, drone in STATE["drones"].items():
@@ -1831,6 +3443,13 @@ def simulate_step():
 		_mark_order_in_progress_if_started(drone_id, drone)
 		route = drone.get("route") or []
 		idx = drone.get("target_idx", 0)
+		# Update current echelon from route_segments (preferred), fallback to edge inference
+		try:
+			segs = drone.get("route_segments") or []
+			if segs and idx > 0 and (idx - 1) < len(segs):
+				drone["current_echelon"] = segs[idx - 1].get("echelon")
+		except Exception:
+			pass
 		if not route or idx >= len(route):
 			mark_order_completed_if_any(drone_id)
 			if drone.get("status") != "charging":
@@ -1841,6 +3460,37 @@ def simulate_step():
 			continue
 		current = drone["pos"]
 		target = route[idx]
+		# Periodic movement debug (throttled per drone)
+		try:
+			now = time.time()
+			last = float(drone.get("_last_move_log_ts") or 0.0)
+			if now - last >= 5.0:
+				drone["_last_move_log_ts"] = now
+				logger.info(
+					"simulate_step: drone=%s status=%s target_idx=%s/%s pos=%s target=%s dist=%.1fm",
+					drone_id,
+					drone.get("status"),
+					int(idx),
+					int(len(route) if isinstance(route, list) else 0),
+					tuple(current) if isinstance(current, (list, tuple)) and len(current) == 2 else current,
+					tuple(target) if isinstance(target, (list, tuple)) and len(target) == 2 else target,
+					float(haversine_m(tuple(current), tuple(target))) if isinstance(current, (list, tuple)) and isinstance(target, (list, tuple)) else -1.0,
+				)
+		except Exception:
+			pass
+		# Echelon hint for UI: infer from infrastructure edge (if available)
+		try:
+			infra_G = STATE.get("infrastructure_graph")
+			if infra_G is not None and getattr(infra_G, "number_of_edges", lambda: 0)() > 0:
+				n1 = _routing_service._find_nearest_node(infra_G, tuple(current))
+				n2 = _routing_service._find_nearest_node(infra_G, tuple(target))
+				if n1 is not None and n2 is not None and infra_G.has_edge(n1, n2):
+					ed = infra_G.get_edge_data(n1, n2) or {}
+					drone["current_echelon"] = ed.get("flight_level")
+				else:
+					drone["current_echelon"] = drone.get("current_echelon")
+		except Exception:
+			pass
 		# Для operator_area миссии не перепрокладываем через road graph:
 		# там маршрут уже задан внутренними координатами зоны осмотра.
 		if is_point_in_any_zone(target) and drone.get("mission_mode") != "operator_area":
@@ -2077,6 +3727,7 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 	if drone.get("saved_route_for_charge") is not None:
 		saved = drone.get("saved_route_for_charge") or []
 		drone["route"] = list(saved)
+		drone["route_segments"] = _route_segments_from_coords(drone["route"], mode="empty") if saved else []
 		sidx = int(drone.get("saved_target_idx", 0))
 		drone["target_idx"] = max(0, min(sidx, max(0, len(saved) - 1)))
 		drone["status"] = "enroute"
@@ -2158,6 +3809,8 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 		return False
 
 	drone["route"] = list(res["coords"])
+	drone["route_segments"] = list(res.get("route_segments") or _route_segments_from_coords(drone["route"], mode="empty"))
+	drone["resume_route_segments"] = []
 	drone["target_idx"] = 0
 	# После восстановления миссии обязательно возвращаем дрона в исполняемый статус.
 	drone["status"] = "enroute"
@@ -2185,6 +3838,9 @@ def _resume_after_charge_or_hold(drone_id: str, drone: Dict[str, Any]) -> None:
 	if resume:
 		drone["route"] = list(resume)
 		drone["resume_route"] = []
+		seg_resume = drone.get("resume_route_segments") or []
+		drone["route_segments"] = list(seg_resume) if seg_resume else _route_segments_from_coords(drone["route"], mode="empty")
+		drone["resume_route_segments"] = []
 		drone["target_idx"] = 0
 		# После зарядки при восстановленном маршруте переводим в активный исполняемый статус.
 		drone["status"] = "enroute"
@@ -2229,8 +3885,8 @@ def maybe_route_to_base_or_station(drone: Dict[str, Any]):
 	_, coords, _ = plan_route_for(pos, best, drone["type"], battery, reserve_pct=reserve)
 	# Если прямой путь недостижим — строим маршрут через станции зарядки (plan_with_chargers)
 	if not coords:
-		G = STATE.get("city_graph")
-		charger_nodes = STATE.get("charger_nodes") or {"base": None, "stations": []}
+		G = get_active_routing_graph()
+		charger_nodes = limited_charger_nodes(pos)
 		if G and charger_nodes.get("base") is not None or (charger_nodes.get("stations") or []):
 			start_node = _routing_service._find_nearest_node(G, pos)
 			goal_node = None
@@ -2507,23 +4163,95 @@ def compute_link_quality(drone: Dict[str, Any]):
         drone["link_quality"] = 0.5
 
 def ensure_base_drones():
-    base = STATE.get("base")
-    inv = STATE.get("inventory") or {}
-    if not base or not isinstance(inv, dict):
-        return
-    # If there are already drones, do not auto-spawn duplicates
-    if STATE.get("drones"):
-        return
-    total = sum(max(0, int(v)) for v in inv.values())
-    if total <= 0:
-        return
-    for typ, cnt in inv.items():
-        try:
-            n = max(0, int(cnt))
-        except Exception:
-            n = 0
-        for _ in range(n):
-            spawn_drone(typ, pos=tuple(base), battery=100.0)
+	"""
+	Bootstrap drones for simulation/UI.
+	- Preferred: place drones on charging stations from infrastructure with capacity-driven distribution.
+	- Fallback: legacy behaviour — spawn from base inventory.
+	"""
+	infra = STATE.get("infrastructure") or {}
+	charging = (infra.get("charging_stations") or []) if isinstance(infra, dict) else []
+	drones = STATE.get("drones") or {}
+	# If drones exist but they were spawned from base inventory, replace them once infra stations are available.
+	if drones and charging:
+		all_idle = all((d or {}).get("status") in (None, "idle") for d in drones.values())
+		all_from_base = all((d or {}).get("home_station_id") == "base" for d in drones.values())
+		if all_idle and all_from_base:
+			STATE["drones"] = {}
+			drones = {}
+		else:
+			return
+	# If there are already drones (non-base), do not auto-spawn duplicates
+	if drones:
+		return
+
+	def _split_capacity(total: int) -> Tuple[int, int, int]:
+		t = max(0, int(total))
+		cargo = int(round(t * 0.75))
+		operator = int(round(t * 0.15))
+		cleaner = t - cargo - operator
+		if cleaner < 0:
+			deficit = -cleaner
+			cut_cargo = min(deficit, cargo)
+			cargo -= cut_cargo
+			deficit -= cut_cargo
+			if deficit > 0:
+				cut_operator = min(deficit, operator)
+				operator -= cut_operator
+				deficit -= cut_operator
+			cleaner = 0
+		return cargo, operator, cleaner
+
+	# Infrastructure-driven spawn (charging stations)
+	if charging:
+		for st in charging:
+			try:
+				pos = st.get("pos")
+				if not (isinstance(pos, (list, tuple)) and len(pos) == 2):
+					continue
+				st_id = st.get("id")
+				# Prefer explicit precomputed totals if present
+				t_total = st.get("cluster_drones_total")
+				t_cargo = st.get("cluster_drones_cargo")
+				t_op = st.get("cluster_drones_monitoring")
+				t_srv = st.get("cluster_drones_service")
+
+				if t_total is not None and t_cargo is not None and t_op is not None and t_srv is not None:
+					n_cargo = max(0, int(round(float(t_cargo))))
+					n_operator = max(0, int(round(float(t_op))))
+					n_cleaner = max(0, int(round(float(t_srv))))
+				else:
+					cap = st.get("capacity")
+					try:
+						cap_i = int(round(float(cap))) if cap is not None else 2
+					except Exception:
+						cap_i = 2
+					n_cargo, n_operator, n_cleaner = _split_capacity(cap_i)
+
+				for _ in range(n_cargo):
+					spawn_drone("cargo", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id)
+				for _ in range(n_operator):
+					spawn_drone("operator", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id)
+				for _ in range(n_cleaner):
+					spawn_drone("cleaner", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id)
+			except Exception:
+				continue
+		return
+
+	# Legacy fallback: base + inventory
+	base = STATE.get("base")
+	inv = STATE.get("inventory") or {}
+	if not base or not isinstance(inv, dict):
+		return
+	total = sum(max(0, int(v)) for v in inv.values())
+	if total <= 0:
+		return
+	for typ, cnt in inv.items():
+		try:
+			n = max(0, int(cnt))
+		except Exception:
+			n = 0
+		for _ in range(n):
+			spawn_drone(typ, pos=tuple(base), battery=100.0, home_station_id="base", current_station_id="base")
 
 def _next_drone_id(drone_type: str) -> str:
     """Генерирует имя дрона по типу: грузовой1, операторский1, мойщик1 и т.д."""
@@ -2539,17 +4267,26 @@ def _next_drone_id(drone_type: str) -> str:
     return f"{name_ru}{next_num}"
 
 
-def spawn_drone(drone_type: str, pos: Tuple[float, float], battery: float = 100.0) -> str:
-    did = _next_drone_id(drone_type)
-    STATE["drones"][did] = {
-        "pos": pos,
-        "type": drone_type,
-        "battery": float(battery),
-        "route": [],
-        "target_idx": 0,
-        "status": "idle",
-    }
-    return did
+def spawn_drone(
+	drone_type: str,
+	pos: Tuple[float, float],
+	battery: float = 100.0,
+	home_station_id: Optional[str] = None,
+	current_station_id: Optional[str] = None,
+) -> str:
+	did = _next_drone_id(drone_type)
+	STATE["drones"][did] = {
+		"pos": pos,
+		"type": drone_type,
+		"battery": float(battery),
+		"route": [],
+		"target_idx": 0,
+		"status": "idle",
+		"home_station_id": home_station_id,
+		"current_station_id": current_station_id,
+		"current_echelon": None,
+	}
+	return did
 
 def spawn_drone_from_inventory(pref_type: str, order_id: Optional[str] = None, caller: str = "unknown") -> Optional[str]:
     base = STATE.get("base")
@@ -2579,11 +4316,17 @@ def spawn_drone_from_inventory(pref_type: str, order_id: Optional[str] = None, c
     return did
 
 # Split a full route into two: up to first charger (station/base), then remainder to resume after charging
-def apply_midroute_charging(drone: Dict[str, Any], full_coords: List[Tuple[float, float]]):
+def apply_midroute_charging(
+	drone: Dict[str, Any],
+	full_coords: List[Tuple[float, float]],
+	full_segments: Optional[List[Dict[str, Any]]] = None,
+):
     try:
         if not isinstance(full_coords, list) or len(full_coords) < 2:
             drone["route"] = list(full_coords or [])
             drone["resume_route"] = []
+            drone["route_segments"] = []
+            drone["resume_route_segments"] = []
             drone["target_idx"] = 0
             drone["status"] = "enroute" if full_coords else "idle"
             return
@@ -2600,16 +4343,26 @@ def apply_midroute_charging(drone: Dict[str, Any], full_coords: List[Tuple[float
         if split_idx is not None:
             drone["route"] = list(full_coords[:split_idx+1])
             drone["resume_route"] = list(full_coords[split_idx+1:])
+            if full_segments:
+                drone["route_segments"] = list(full_segments[:split_idx])
+                drone["resume_route_segments"] = list(full_segments[split_idx:])
+            else:
+                drone["route_segments"] = _route_segments_from_coords(drone["route"], mode="empty")
+                drone["resume_route_segments"] = _route_segments_from_coords(drone["resume_route"], mode="empty")
             drone["target_idx"] = 0
             drone["status"] = "enroute"
         else:
             drone["route"] = list(full_coords)
             drone["resume_route"] = []
+            drone["route_segments"] = list(full_segments) if full_segments else _route_segments_from_coords(drone["route"], mode="empty")
+            drone["resume_route_segments"] = []
             drone["target_idx"] = 0
             drone["status"] = "enroute"
     except Exception:
         drone["route"] = list(full_coords or [])
         drone["resume_route"] = []
+        drone["route_segments"] = _route_segments_from_coords(drone["route"], mode="empty") if drone.get("route") else []
+        drone["resume_route_segments"] = []
         drone["target_idx"] = 0
         drone["status"] = "enroute" if full_coords else "idle"
 
@@ -2691,5 +4444,33 @@ def haversine_m(a: Tuple[float, float], b: Tuple[float, float]) -> float:
 	sa = math.sin(dlat/2.0)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2.0)**2
 	c = 2.0 * math.atan2(math.sqrt(sa), math.sqrt(1.0-sa))
 	return R * c
+
+
+def normalize_latlon(coord: Any, *, ctx: str = "") -> Optional[Tuple[float, float]]:
+	"""
+	Normalize coordinate to (lat, lon) for STATE/orders/drones/routes.
+	GeoJSON remains (lon, lat) elsewhere.
+	"""
+	try:
+		if coord is None:
+			return None
+		if isinstance(coord, (list, tuple)) and len(coord) == 2:
+			lat, lon = float(coord[0]), float(coord[1])
+		else:
+			return None
+		city = (STATE.get("city") or "").lower()
+		if "balakovo" in city:
+			c0 = (52.0278, 47.8007)
+			d1 = haversine_m((lat, lon), c0)
+			d2 = haversine_m((lon, lat), c0)
+			if d2 + 10.0 < d1:
+				logger.warning("normalize_latlon: swapped for Balakovo ctx=%s in=%s out=%s", ctx, (lat, lon), (lon, lat))
+				return (lon, lat)
+		if abs(lat) > 90 and abs(lon) <= 90:
+			logger.warning("normalize_latlon: lat out of range ctx=%s in=%s out=%s", ctx, (lat, lon), (lon, lat))
+			return (lon, lat)
+		return (lat, lon)
+	except Exception:
+		return None
 
 # Run helper for uvicorn: python -m uvicorn api_server:app --reload
