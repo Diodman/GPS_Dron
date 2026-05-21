@@ -129,6 +129,14 @@ class RoutingService:
             if G is None or len(G.nodes) == 0:
                 return None, None, 0.0
 
+            # IMPORTANT: do not mutate shared graphs (e.g. STATE["city_graph"]).
+            # Work on a copy so tmp nodes/edges cannot corrupt global state or KDTree cache.
+            try:
+                G = G.copy()
+            except Exception:
+                # If graph cannot be copied for some reason, fall back to safe no-route result.
+                return None, None, 0.0
+
             # Find nearest graph nodes to connect temporary points
             start_nearest = self._find_nearest_node(G, start_coords)
             end_nearest = self._find_nearest_node(G, end_coords)
@@ -157,16 +165,19 @@ class RoutingService:
                 return float(np.sqrt(lat_diff**2 + lon_diff**2))
 
             # Connect to several nearest neighbors to avoid being blocked by zones
+            candidate_nodes: list[tuple[Any, tuple[float, float]]] = []
             candidates_start = []
             candidates_end = []
             for node, attr in G.nodes(data=True):
                 pos = attr.get('pos')
-                if not pos:
+                if not pos or len(pos) != 2:
                     continue
                 if attr.get('weight', 0) == float('inf'):
                     continue
-                candidates_start.append((node, _approx_dist(start_coords, pos)))
-                candidates_end.append((node, _approx_dist(end_coords, pos)))
+                pos_t = (float(pos[0]), float(pos[1]))
+                candidate_nodes.append((node, pos_t))
+                candidates_start.append((node, _approx_dist(start_coords, pos_t)))
+                candidates_end.append((node, _approx_dist(end_coords, pos_t)))
 
             candidates_start.sort(key=lambda x: x[1])
             candidates_end.sort(key=lambda x: x[1])
@@ -189,11 +200,15 @@ class RoutingService:
                 while node in G.nodes:
                     node = (node[0], node[1] + 1)
                 G.add_node(node, pos=wp, type='temp')
-                for n, dist in sorted(candidates_start, key=lambda x: x[1])[:k]:
-                    w = max(1.0, _approx_dist(wp, G.nodes[n]['pos']))
-                    G.add_edge(node, n, weight=w, type='temp_connection')
+                # Waypoint must connect to nearest nodes relative to itself (not start candidates).
+                wp_candidates = []
+                for n, npos in candidate_nodes:
+                    wp_candidates.append((n, _approx_dist(wp, npos)))
+                wp_candidates.sort(key=lambda x: x[1])
+                for n, dist in wp_candidates[:k]:
+                    G.add_edge(node, n, weight=max(1.0, dist), type='temp_connection')
                     if getattr(G, "is_directed", lambda: False)():
-                        G.add_edge(n, node, weight=w, type='temp_connection')
+                        G.add_edge(n, node, weight=max(1.0, dist), type='temp_connection')
                 sequence.append(node)
                 temp_nodes.append(node)
             sequence.append(tmp_end)
@@ -212,34 +227,11 @@ class RoutingService:
             path = full_path
 
             if not path:
-                # Cleanup before return
-                try:
-                    if tmp_start in G:
-                        G.remove_node(tmp_start)
-                    if tmp_end in G:
-                        G.remove_node(tmp_end)
-                    for n in temp_nodes:
-                        if n in G:
-                            G.remove_node(n)
-                except Exception:
-                    pass
                 return None, None, 0.0
 
             # Build coords and length while temp nodes are still in G
             coords = [G.nodes[n]['pos'] for n in path]
             length = self._calculate_path_length(G, path)
-
-            # Cleanup temp nodes/edges
-            try:
-                if tmp_start in G:
-                    G.remove_node(tmp_start)
-                if tmp_end in G:
-                    G.remove_node(tmp_end)
-                for n in temp_nodes:
-                    if n in G:
-                        G.remove_node(n)
-            except Exception:
-                pass
 
             return path, coords, length
         except Exception as e:
@@ -828,8 +820,19 @@ class RoutingService:
             # Единая формула: m_per_pct = метров на 1% заряда → расход в % = distance_m / m_per_pct (без *100)
             drain = seg_len / m_per_pct
             battery_after = max(0.0, battery - drain)
-            if battery_after < 0:
-                return None, None, 0.0, []
+            # Enforce reserve constraints and charger arrival minimum (avoid infeasible chains).
+            p = self._get_drone_params(drone_type)
+            reserve = float(reserve_pct) if reserve_pct is not None else float(p.get("reserve_pct", DEFAULT_RESERVE_PCT))
+            charger_arrival_min = float(p.get("charger_arrival_min_pct", DEFAULT_CHARGER_ARRIVAL_MIN_PCT))
+            min_at_charger = max(charger_arrival_min, reserve)
+            if b in charger_names:
+                if battery_after + 1e-9 < min_at_charger:
+                    # Too risky: cannot arrive to charger with minimum required percentage
+                    return None, None, 0.0, []
+            else:
+                if battery_after + 1e-9 < reserve:
+                    # Can't finish non-charger segment without breaking reserve
+                    return None, None, 0.0, []
             if b in charger_names:
                 visited_chargers.append(b)
             battery = 100.0 if b in charger_names else battery_after

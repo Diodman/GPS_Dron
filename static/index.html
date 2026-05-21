@@ -674,6 +674,7 @@
         <h4>🌆 Город</h4>
 		<input id="city" value="Balakovo, Russia" />
         <button onclick="loadCity()">🗺️ Загрузить</button>
+        <div class="muted" id="cityStatus" style="margin-top:8px;">Город: —</div>
 	</div>
 	<div id="rightPanel">
         <div class="section battery-mode-panel">
@@ -703,7 +704,10 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 let map = L.map('map').setView([52.0278, 47.8007], 12);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+L.tileLayer('https://tile.openstreetmap.de/{z}/{x}/{y}.png', {
+	maxZoom: 19,
+	attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+}).addTo(map);
 let droneMarkers = {};
 let zoneLayers = [];
 let routeLayers = [];
@@ -783,6 +787,25 @@ async function fetchInfrastructure(){
             infraGeo = j.geojson;
             infraVersion = j.version || infraVersion;
             renderInfrastructureLayers(infraGeo);
+            function fcLen(fc){ return (fc && fc.type==='FeatureCollection' && Array.isArray(fc.features)) ? fc.features.length : 0; }
+            let voroEchelon = 0;
+            if (infraGeo.voronoi_edges_by_echelon && typeof infraGeo.voronoi_edges_by_echelon === 'object'){
+                for (const k of Object.keys(infraGeo.voronoi_edges_by_echelon)){
+                    voroEchelon += fcLen(infraGeo.voronoi_edges_by_echelon[k]);
+                }
+            }
+            const voroFlat = fcLen(infraGeo.voronoi_edges);
+            const hasVoronoiPaths = voroFlat > 0 || voroEchelon > 0;
+            console.info('[infrastructure geojson] layers:', {
+                trunk: fcLen(infraGeo.trunk),
+                branch_edges: fcLen(infraGeo.branch_edges),
+                local_edges: fcLen(infraGeo.local_edges),
+                voronoi_edges: voroFlat,
+                voronoi_edges_by_echelon_total: voroEchelon,
+                charging_type_a: fcLen(infraGeo.charging_type_a),
+                charging_type_b: fcLen(infraGeo.charging_type_b),
+                voronoi_paths_present: hasVoronoiPaths,
+            });
             infraLoading = false;
             if (st) st.textContent = `Инфраструктура: готово (v${infraVersion})`;
         } else {
@@ -1066,7 +1089,21 @@ function updateDrones(drones){
             }
             droneMarkers[id].setLatLng(d.pos);
             droneMarkers[id].setIcon(icon);
-            droneMarkers[id].setPopupContent(droneDisplayName);
+            let popupHtml = droneDisplayName;
+            const rdPop = d.route_diagnostics;
+            if (rdPop && typeof rdPop === 'object'){
+                const rstyle = routeStyleLabelRu(d.type);
+                if (rstyle){
+                    popupHtml += `<div style="font-size:12px;opacity:.85;margin-top:4px">Тип маршрута: ${rstyle}</div>`;
+                }
+            }
+            if (rdPop && (rdPop.trunk_pct != null || rdPop.off_network_pct != null)){
+                const trp = rdPop.trunk_pct != null ? Math.round(Number(rdPop.trunk_pct)) : '—';
+                const lvp = rdPop.local_voronoi_pct != null ? Math.round(Number(rdPop.local_voronoi_pct)) : '—';
+                const ofp = rdPop.off_network_pct != null ? Math.round(Number(rdPop.off_network_pct)) : '—';
+                popupHtml += `<div style="font-size:12px;opacity:.85;margin-top:4px">Магистраль ${trp}% · локальн. ${lvp}% · off ${ofp}%</div>`;
+            }
+            droneMarkers[id].setPopupContent(popupHtml);
             if (isFree){
                 infraLayerGroups.freeDrones.addLayer(droneMarkers[id]);
             } else {
@@ -1078,21 +1115,21 @@ function updateDrones(drones){
         // Prefer segment-based rendering (layer + echelon)
         if (Array.isArray(d.route_segments) && d.route_segments.length){
             const layerColors = {
-                'local':'#3b82f6',
-                'voronoi':'#60a5fa',
+                'local':'#2563eb',
+                'voronoi':'#38bdf8',
                 'branch':'#f97316',
-                'trunk':'#ef4444',
+                'trunk':'#b91c1c',
                 'off_network':'#94a3b8'
             };
             for (const seg of d.route_segments){
                 if (!seg || !seg.from || !seg.to) continue;
                 const lay = (seg.layer||'off_network');
                 const col = layerColors[lay] || color;
-                const w = lay === 'trunk' ? 5 : (lay === 'branch' ? 4 : (lay === 'off_network' ? 2 : 3));
+                const w = lay === 'trunk' ? 6 : (lay === 'branch' ? 4 : (lay === 'off_network' ? 2 : 3));
                 const dash = lay === 'off_network' ? '6 6' : null;
                 const poly = L.polyline([seg.from, seg.to], {color: col, weight: w, opacity: 0.9, dashArray: dash || undefined});
                 poly.addTo(infraLayerGroups.droneRoutes);
-                poly.bindTooltip(`${lay} • L${seg.echelon ?? '—'} • ${Math.round(seg.length_m||0)} м • ${seg.mode||''}`);
+                poly.bindTooltip(`${lay} • L${seg.echelon ?? '—'} • ${Math.round(seg.length_m||0)} м • ${seg.mode||''}`, { sticky: true });
                 routeLayers.push(poly);
             }
         } else if (d.route && d.route.length){
@@ -1111,8 +1148,22 @@ function updateDrones(drones){
         const bat = d.battery!=null?`${d.battery.toFixed(0)}%`:'-';
         const lq = d.link_quality!=null?qualityPill(d.link_quality):'';
         const toStreet = (d.route && d.target_idx!=null && d.route[d.target_idx]) ? d.route[d.target_idx] : null;
+        let routeDiagLine = '';
+        const rd = d.route_diagnostics;
+        if (rd && typeof rd === 'object'){
+            const rstyle = routeStyleLabelRu(d.type);
+            if (rstyle){
+                routeDiagLine += `<br><span class="muted">Тип маршрута: ${rstyle}</span>`;
+            }
+        }
+        if (rd && (rd.trunk_pct != null || rd.off_network_pct != null)){
+            const tr = rd.trunk_pct != null ? Math.round(Number(rd.trunk_pct)) : '—';
+            const lv = rd.local_voronoi_pct != null ? Math.round(Number(rd.local_voronoi_pct)) : '—';
+            const off = rd.off_network_pct != null ? Math.round(Number(rd.off_network_pct)) : '—';
+            routeDiagLine += `<br><span class="muted">Магистраль ${tr}% · локальн./Voronoi ${lv}% · off_network ${off}%</span>`;
+        }
         item.innerHTML = `<b>${displayName}</b> • ${ruStatus(d.status)||'-'} ${lq}<br>`+
-            `Заряд: ${bat} • Осталось: ${eta}` + (d.current_echelon!=null?` • Эшелон: <b>${d.current_echelon}</b>`:'') + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
+            `Заряд: ${bat} • Осталось: ${eta}` + (d.current_echelon!=null?` • Эшелон: <b>${d.current_echelon}</b>`:'') + routeDiagLine + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
         item.onclick = ()=> focusDrone(id);
 		list.appendChild(item);
         if (toStreet){ fetchStreet(toStreet, id); }
@@ -1175,8 +1226,79 @@ function updateStationCountsUI(){
 }
 
 async function loadCity(){
-	const city = document.getElementById('city').value;
-	await fetch('/api/load_city', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({city})});
+    const statusEl = document.getElementById('cityStatus');
+    const infraEl = document.getElementById('infraStatus');
+	const city = (document.getElementById('city').value || '').trim();
+    if (!city){
+        if (statusEl) statusEl.textContent = 'Город: не задан (введите название и нажмите «Загрузить»)';
+        return;
+    }
+    if (statusEl) statusEl.textContent = 'Город: загрузка графа...';
+    if (infraEl) infraEl.textContent = 'Инфраструктура: —';
+    try{
+        const r = await fetch('/api/load_city', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({city})
+        });
+        const j = await r.json().catch(()=> ({}));
+        if (!r.ok || !j || j.ok === false){
+            const err = (j && j.error) ? j.error : `HTTP ${r.status}`;
+            if (statusEl) statusEl.textContent = `Город: ошибка загрузки (${err})`;
+            if (infraEl) infraEl.textContent = 'Инфраструктура: —';
+            return;
+        }
+        if (statusEl) statusEl.textContent = 'Город: граф загружен, строим инфраструктуру...';
+        // infrastructure build happens asynchronously after /api/load_city; poll a lightweight status endpoint
+        pollInfrastructureBuildStatus();
+    }catch(e){
+        if (statusEl) statusEl.textContent = 'Город: ошибка загрузки (см. консоль)';
+        console.warn('loadCity failed', e);
+    }
+}
+
+let infraPollTimer = null;
+async function pollInfrastructureBuildStatus(){
+    const infraEl = document.getElementById('infraStatus');
+    const statusEl = document.getElementById('cityStatus');
+    if (infraPollTimer) { clearInterval(infraPollTimer); infraPollTimer = null; }
+    let tries = 0;
+    // immediate tick
+    const tick = async ()=>{
+        tries++;
+        try{
+            const r = await fetch('/api/infrastructure');
+            const j = await r.json();
+            const st = (j && j.build_status) ? j.build_status : null;
+            const lastErr = (j && j.last_error) ? j.last_error : null;
+            const v = (j && j.version) ? j.version : 0;
+            if (st === 'ready' && v){
+                if (infraEl) infraEl.textContent = `Инфраструктура: готово (v${v})`;
+                if (statusEl) statusEl.textContent = 'Город: готово';
+                clearInterval(infraPollTimer); infraPollTimer = null;
+                // load geojson layers
+                infraVersion = v;
+                fetchInfrastructure();
+                return;
+            }
+            if (st === 'error'){
+                if (infraEl) infraEl.textContent = 'Инфраструктура: ошибка построения';
+                if (statusEl) statusEl.textContent = `Город: инфраструктура не построена (${lastErr || 'ошибка'})`;
+                clearInterval(infraPollTimer); infraPollTimer = null;
+                return;
+            }
+            // building/idle/unknown
+            if (infraEl) infraEl.textContent = 'Инфраструктура: строится...';
+        }catch(e){
+            if (infraEl) infraEl.textContent = 'Инфраструктура: ошибка статуса';
+        }
+        if (tries >= 60){
+            clearInterval(infraPollTimer); infraPollTimer = null;
+            if (infraEl) infraEl.textContent = 'Инфраструктура: строится... (долго)';
+        }
+    };
+    await tick();
+    infraPollTimer = setInterval(tick, 2000);
 }
 
 function parseMaybeCoords(s){
@@ -1411,6 +1533,13 @@ function ruStatus(s){
 function droneTypeRu(t){
     return ({ 'cargo':'грузовой', 'operator':'операторский', 'cleaner':'сервисный' })[t]||t||'—';
 }
+function routeStyleLabelRu(t){
+    const x = String(t||'').toLowerCase();
+    if (x === 'cargo') return 'магистральный';
+    if (x === 'operator') return 'гибридный';
+    if (x === 'cleaner') return 'локальный';
+    return '';
+}
 
 function focusDrone(id){
     const m = droneMarkers[id];
@@ -1444,8 +1573,8 @@ async function saveBase(){
     await fetch('/api/base', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({base: bc, inventory: inv})});
 }
 
-// Автозагрузка города при старте (для удобства)
-window.addEventListener('load', ()=>{ loadCity(); updateOrderFormByDroneType(); });
+// Не автозагружаем город: тяжёлая операция. Пользователь запускает явно кнопкой «Загрузить».
+window.addEventListener('load', ()=>{ updateOrderFormByDroneType(); });
 // Load base, stations and weather on startup to populate UI quickly
 window.addEventListener('load', async ()=>{
     try{
@@ -1462,6 +1591,8 @@ window.addEventListener('load', async ()=>{
         const s = await fetch('/api/state').then(x=>x.json());
         if (s.weather) updateWeatherUI(s.weather);
         if (s.station_states) { window.stationStates = s.station_states; updateStationCountsUI(); }
+        const cs = document.getElementById('cityStatus');
+        if (cs) cs.textContent = s.city ? `Город: ${s.city}` : 'Город: —';
         const st = document.getElementById('infraStatus');
         if (s.infrastructure_version){
             infraVersion = s.infrastructure_version;
