@@ -568,7 +568,7 @@
             <h4>🏠 База и инвентарь</h4>
             <label>Координаты базы</label>
             <div class="row">
-                <input id="base" placeholder="52.0278, 47.8007"/>
+                <input id="base" placeholder="48.7080, 44.5133"/>
                 <button onclick="useClick('base')">📍</button>
             </div>
             <div class="row">
@@ -592,9 +592,9 @@
         <!-- Грузовой: откуда, куда, промежуточные точки -->
         <div id="orderFormCargo" class="order-form-block">
             <label>📍 Откуда (широта, долгота или адрес)</label>
-            <input id="from" placeholder="52.0278, 47.8007 или адрес" />
+            <input id="from" placeholder="48.7080, 44.5133 или адрес" />
             <label>📍 Куда (широта, долгота или адрес)</label>
-            <input id="to" placeholder="52.0278, 47.8007 или адрес" />
+            <input id="to" placeholder="48.7080, 44.5133 или адрес" />
             <div class="row">
                 <button type="button" onclick="useClick('from')">📍 Откуда</button>
                 <button type="button" onclick="useClick('to')">📍 Куда</button>
@@ -619,7 +619,7 @@
             </div>
             <div id="operatorPointBlock">
                 <label>📍 Точка назначения (широта, долгота или адрес)</label>
-                <input id="operatorPoint" placeholder="52.0278, 47.8007 или адрес" />
+                <input id="operatorPoint" placeholder="48.7080, 44.5133 или адрес" />
                 <button type="button" onclick="useClick('operatorPoint')">📍 Указать на карте</button>
             </div>
             <div id="operatorAreaBlock" style="display:none">
@@ -632,7 +632,7 @@
         <!-- Сервисный: только финальная точка -->
         <div id="orderFormService" class="order-form-block" style="display:none">
             <label>📍 Финальная точка (широта, долгота или адрес)</label>
-            <input id="toService" placeholder="52.0278, 47.8007 или адрес" />
+            <input id="toService" placeholder="48.7080, 44.5133 или адрес" />
             <button type="button" onclick="useClick('toService')">📍 Указать на карте</button>
         </div>
 
@@ -669,12 +669,12 @@
             <button onclick="clearStations()">🗑️ Очистить</button>
         </div>
         <label>📍 Массовое добавление (по одной координате в строке: lat, lon)</label>
-        <textarea id="stationsBulk" rows="3" placeholder="52.027800, 47.800700&#10;52.030000, 47.805000"></textarea>
+        <textarea id="stationsBulk" rows="3" placeholder="48.708000, 44.513300&#10;48.710000, 44.518000"></textarea>
         <button onclick="bulkAddStations()">➕ Добавить станции</button>
         <h4>🌆 Город</h4>
-		<input id="city" value="Balakovo, Russia" />
+		<input id="city" value="Волгоград, Россия" />
         <button onclick="loadCity()">🗺️ Загрузить</button>
-        <div class="muted" id="cityStatus" style="margin-top:8px;">Город: —</div>
+        <div class="muted" id="cityStatus" style="margin-top:8px;">Город: Волгоград, Россия</div>
 	</div>
 	<div id="rightPanel">
         <div class="section battery-mode-panel">
@@ -703,7 +703,7 @@
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-let map = L.map('map').setView([52.0278, 47.8007], 12);
+let map = L.map('map').setView([48.7080, 44.5133], 12);
 L.tileLayer('https://tile.openstreetmap.de/{z}/{x}/{y}.png', {
 	maxZoom: 19,
 	attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
@@ -754,7 +754,7 @@ L.control.layers(
         "🧩 Cluster hulls": infraLayerGroups.clusterHulls,
         "🧭 Drone routes": infraLayerGroups.droneRoutes,
         "⬆ Drone echelon markers": infraLayerGroups.droneEchelons,
-        "🟦 Free drones (limited)": infraLayerGroups.freeDrones,
+        "🟦 Free drones": infraLayerGroups.freeDrones,
     },
     { collapsed: false }
 ).addTo(map);
@@ -839,15 +839,21 @@ function renderInfrastructureLayers(geo){
         onEachFeature: (f, layer)=>{
             const p = (f.properties||{});
             const cap = p.cluster_drones_total != null ? p.cluster_drones_total : (p.cluster_drones_capacity != null ? p.cluster_drones_capacity : '—');
-            layer.bindTooltip(`⚡ Charge A • cap: ${cap} • cluster: ${p.cluster_id ?? '—'}`);
+            const cargo = p.cluster_drones_cargo ?? '—';
+            const op = p.cluster_drones_monitoring ?? '—';
+            const srv = p.cluster_drones_service ?? '—';
+            layer.bindTooltip(`⚡ Charge A • дроны: ${cap} (груз ${cargo}, оп ${op}, серв ${srv}) • cluster: ${p.cluster_id ?? '—'}`);
         }
     });
     addGeoJsonToGroup(infraLayerGroups.chargingB, limitFC(geo.charging_type_b, MAX_STATIONS_RENDER), {
-        pointToLayer: (f, latlng)=> L.circleMarker(latlng, {radius:3, color:'#22c55e', weight:1, fillOpacity:0.55, fillColor:'#22c55e'}),
+        pointToLayer: (f, latlng)=> L.circleMarker(latlng, {radius:5, color:'#22c55e', weight:1, fillOpacity:0.6, fillColor:'#22c55e'}),
         onEachFeature: (f, layer)=>{
             const p = (f.properties||{});
             const cap = p.cluster_drones_total != null ? p.cluster_drones_total : (p.cluster_drones_capacity != null ? p.cluster_drones_capacity : '—');
-            layer.bindTooltip(`⚡ Charge B • cap: ${cap} • cluster: ${p.cluster_id ?? '—'}`);
+            const cargo = p.cluster_drones_cargo ?? '—';
+            const op = p.cluster_drones_monitoring ?? '—';
+            const srv = p.cluster_drones_service ?? '—';
+            layer.bindTooltip(`⚡ Charge B • дроны: ${cap} (груз ${cargo}, оп ${op}, серв ${srv}) • cluster: ${p.cluster_id ?? '—'}`);
         }
     });
 
@@ -1064,7 +1070,7 @@ function updateDrones(drones){
 	list.innerHTML='';
     const palette = ['#4285F4','#EA4335','#FBBC05','#34A853','#9C27B0','#FF9800','#795548','#607D8B'];
     const ids = Object.keys(drones);
-    const MAX_FREE_DRONES = 200;
+    const MAX_FREE_DRONES = 1000;
     let freeShown = 0;
     for (let idx=0; idx<ids.length; idx++){
         const id = ids[idx];

@@ -15,7 +15,7 @@ DEFAULT_CHARGER_ARRIVAL_MIN_PCT = 5.0
 
 BATTERY_MODE_REALITY = "reality"
 BATTERY_MODE_TEST = "test"
-TEST_RANGE_DIVISOR = 8  # в тесте дальность в 8 раз меньше — маршруты почти всегда через зарядки
+TEST_RANGE_DIVISOR = 2  # в тесте дальность короче, но городские плечи всё ещё должны строиться
 
 
 class RoutingService:
@@ -304,7 +304,7 @@ class RoutingService:
                 best_path = None
 
             if not best_path:
-                self.logger.warning(f"Не удалось найти подходящий путь между {start} и {end}")
+                self.logger.debug(f"Не удалось найти подходящий путь между {start} и {end}")
                 return None
 
             # best_path есть и укладывается в max_range
@@ -558,29 +558,28 @@ class RoutingService:
     def _get_drone_params(self, drone_type: str) -> Dict[str, Any]:
         """Параметры по реальным данным расхода (Вт·ч/км, время полёта).
         empty_m_per_pct: метров пути на 1% заряда (пустой). Меньше = выше расход.
-        Грузовой: 150–400 Wh/km, 15–40 мин → ~12 км пустой, ~8 км с грузом.
-        Операторский: 40–120 Wh/km, 20–40 мин → ~20 км / ~15 км.
-        Сервисный: 30–80 Wh/km, 25–60 мин → ~28 км / ~20 км.
+        Грузовой: увеличенная ёмкость для городских плеч через ближайшие станции.
+        Операторский и сервисный: увеличенный запас для устойчивой симуляции.
         """
         params = {
             "cargo": {
-                "battery_range": 12000,
-                "empty_m_per_pct": 120.0,   # ~12 км на 100%, 1% ≈ 120 м
-                "loaded_m_per_pct": 80.0,   # с грузом ~8 км, 1% ≈ 80 м
+                "battery_range": 80000,
+                "empty_m_per_pct": 800.0,   # ~80 км на 100%, 1% ≈ 800 м
+                "loaded_m_per_pct": 600.0,  # с грузом ~60 км, 1% ≈ 600 м
                 "reserve_pct": DEFAULT_RESERVE_PCT,
                 "charger_arrival_min_pct": DEFAULT_CHARGER_ARRIVAL_MIN_PCT,
             },
             "operator": {
-                "battery_range": 20000,
-                "empty_m_per_pct": 200.0,
-                "loaded_m_per_pct": 150.0,
+                "battery_range": 90000,
+                "empty_m_per_pct": 900.0,
+                "loaded_m_per_pct": 700.0,
                 "reserve_pct": DEFAULT_RESERVE_PCT,
                 "charger_arrival_min_pct": DEFAULT_CHARGER_ARRIVAL_MIN_PCT,
             },
             "cleaner": {
-                "battery_range": 28000,
-                "empty_m_per_pct": 280.0,
-                "loaded_m_per_pct": 200.0,
+                "battery_range": 100000,
+                "empty_m_per_pct": 1000.0,
+                "loaded_m_per_pct": 800.0,
                 "reserve_pct": DEFAULT_RESERVE_PCT,
                 "charger_arrival_min_pct": DEFAULT_CHARGER_ARRIVAL_MIN_PCT,
             },
@@ -709,6 +708,25 @@ class RoutingService:
         charger_set = set(charger_names)
         goal_name = "goal"
 
+        # The first hop to a charger is a rescue hop: if the nearest charging
+        # station is just outside the configured battery/test range, allow
+        # enough range to reach that nearest station with a small margin.
+        nearest_start_charger_len = None
+        try:
+            start_node = points.get(start_name)
+            charger_lengths = []
+            if start_node in G.nodes:
+                for ch_name in charger_names:
+                    ch_node = points.get(ch_name)
+                    if ch_node in G.nodes and nx.has_path(G, start_node, ch_node):
+                        pth = nx.shortest_path(G, start_node, ch_node, weight="weight")
+                        if pth and len(pth) > 1:
+                            charger_lengths.append(float(self._calculate_path_length(G, pth)))
+            if charger_lengths:
+                nearest_start_charger_len = min(charger_lengths) * 1.05
+        except Exception:
+            nearest_start_charger_len = None
+
         names = list(points.keys())
         for name_a in names:
             max_dist = max_from_charger if name_a in charger_set else max_from_start
@@ -718,6 +736,8 @@ class RoutingService:
                 # Перегон в зарядку: разрешаем длиннее сегмент (дотянуть до станции)
                 if name_b in charger_set and max_battery_pct_to_reach_charger is not None:
                     max_dist_this = max_to_charger_from_charger if name_a in charger_set else max_to_charger_from_start
+                    if name_a == start_name and nearest_start_charger_len is not None:
+                        max_dist_this = max(max_dist_this, nearest_start_charger_len)
                 # Прямой перегон в цель без зарядки — не длиннее чем max_segment_battery_pct батареи
                 elif max_direct_to_goal is not None and name_b == goal_name and name_a not in charger_set:
                     max_dist_this = min(max_dist, max_direct_to_goal)
@@ -824,7 +844,10 @@ class RoutingService:
             p = self._get_drone_params(drone_type)
             reserve = float(reserve_pct) if reserve_pct is not None else float(p.get("reserve_pct", DEFAULT_RESERVE_PCT))
             charger_arrival_min = float(p.get("charger_arrival_min_pct", DEFAULT_CHARGER_ARRIVAL_MIN_PCT))
-            min_at_charger = max(charger_arrival_min, reserve)
+            if max_battery_pct_to_reach_charger is not None and max_battery_pct_to_reach_charger > 0:
+                min_at_charger = max(charger_arrival_min, 100.0 - float(max_battery_pct_to_reach_charger))
+            else:
+                min_at_charger = max(charger_arrival_min, reserve)
             if b in charger_names:
                 if battery_after + 1e-9 < min_at_charger:
                     # Too risky: cannot arrive to charger with minimum required percentage

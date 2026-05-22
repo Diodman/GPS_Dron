@@ -58,8 +58,8 @@ class DataService:
         - Кандидаты под инфраструктуру: `get_station_candidates()`.
         - Запретные зоны и препятствия: `_get_no_fly_zones()`, высотные методы эшелонов.
         """
-        # Локальный кэш на диске больше не используется как хранилище данных.
-        # Параметр оставлен для совместимости, но директории мы не создаём и файлы не пишем.
+        # Redis — основное хранилище тяжёлых данных. Локальный cache_dir оставляем как
+        # fallback/import старых *.pkl, чтобы после установки Redis не скачивать город заново.
         self.cache_dir = cache_dir
         self.progress_callbacks = []
         self._nominatim_geocoder = Nominatim(user_agent="city_cluster_app", timeout=10)
@@ -70,13 +70,146 @@ class DataService:
         # Redis — основное хранилище кэша тяжёлых данных города
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
         try:
-            self._redis: Redis | None = Redis.from_url(redis_url)
+            self._redis: Redis | None = Redis.from_url(
+                redis_url,
+                socket_connect_timeout=2.0,
+                socket_timeout=30.0,
+            )
             # do not decode responses here; we store bytes for pickle blobs
             self._redis.ping()
+            self.logger.info("Redis cache connected: %s", redis_url)
         except Exception:
             self._redis = None
-            # Локальный диск для кэша данных больше не используется
-            self.logger.info("Redis not available for DataService cache; диск как кэш не используется")
+            self.logger.info("Redis not available for DataService cache; using disk fallback when present")
+
+    def _cache_file_path(self, normalized_name: str) -> str:
+        return os.path.join(self.cache_dir, f"{self._sanitize_name(normalized_name)}.pkl")
+
+    def _ensure_cached_city_shape(
+        self,
+        data: dict,
+        city_name: str,
+        *,
+        network_type: str,
+        simplify: bool,
+    ) -> dict:
+        """Normalizes old disk/Redis city caches to the shape expected by the infra pipeline."""
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        out.setdefault("city_name", city_name)
+        out.setdefault("params", {"network_type": network_type, "simplify": simplify})
+        out.setdefault("no_fly_zones", [])
+
+        if out.get("city_boundary") is None:
+            road_graph = out.get("road_graph")
+            try:
+                gdf_nodes, _ = ox.graph_to_gdfs(road_graph)
+                pts = list(gdf_nodes.geometry)
+                if pts:
+                    out["city_boundary"] = MultiPoint(pts).convex_hull
+                    self.logger.info("City boundary restored from road graph hull for %s", city_name)
+            except Exception as e:
+                self.logger.warning("Не удалось восстановить границу города из кэша: %s", e)
+
+        buildings = out.get("buildings")
+        road_graph = out.get("road_graph")
+        out["stats"] = {
+            "nodes": len(road_graph.nodes) if road_graph is not None else 0,
+            "edges": len(road_graph.edges) if road_graph is not None else 0,
+            "buildings": len(buildings) if buildings is not None else 0,
+        }
+        return out
+
+    def _load_from_disk_cache(
+        self,
+        normalized_name: str,
+        *,
+        network_type: str,
+        simplify: bool,
+    ) -> dict | None:
+        cache_file = self._cache_file_path(normalized_name)
+        if not os.path.exists(cache_file):
+            return None
+        try:
+            with open(cache_file, "rb") as f:
+                data = pickle.load(f)
+            self.logger.info("City data loaded from disk cache: %s", cache_file)
+            return self._ensure_cached_city_shape(
+                data,
+                normalized_name,
+                network_type=network_type,
+                simplify=simplify,
+            )
+        except Exception as e:
+            self.logger.warning("Ошибка загрузки disk cache %s: %s", cache_file, e)
+            return None
+
+    def _ensure_demand_cache(
+        self,
+        data: dict,
+        *,
+        use_all_buildings: bool = False,
+    ) -> dict:
+        """Ensures demand_points/demand_hulls are present before saving/returning cached city data."""
+        if not isinstance(data, dict):
+            return data
+        try:
+            cached = data.get("demand_points")
+            hulls = data.get("demand_hulls")
+            if cached is not None and len(cached) > 0 and hulls is not None and len(hulls) > 0:
+                return data
+        except Exception:
+            pass
+
+        try:
+            demand_result = self.get_demand_points_weighted(
+                data.get("buildings"),
+                data.get("road_graph"),
+                data.get("city_boundary"),
+                method="dbscan",
+                dbscan_eps_m=180.0,
+                dbscan_min_samples=15,
+                return_hulls=True,
+                use_all_buildings=use_all_buildings,
+                no_fly_zones=data.get("no_fly_zones"),
+            )
+            demand_gdf, hulls_gdf = (
+                demand_result if isinstance(demand_result, tuple) else (demand_result, None)
+            )
+            data = dict(data)
+            data["demand_points"] = demand_gdf
+            data["demand_hulls"] = hulls_gdf
+        except Exception as e:
+            self.logger.warning("Не удалось подготовить кластеры спроса для кэша: %s", e)
+        return data
+
+    def _save_city_cache_to_redis(
+        self,
+        redis_key: str | None,
+        clusters_redis_key: str | None,
+        data: dict,
+    ) -> None:
+        if self._redis is None or not redis_key or not isinstance(data, dict):
+            return
+        try:
+            base_data = dict(data)
+            demand_points = base_data.pop("demand_points", None)
+            demand_hulls = base_data.pop("demand_hulls", None)
+            self._redis.set(redis_key, pickle.dumps(base_data))
+            if clusters_redis_key and demand_points is not None:
+                self._redis.set(
+                    clusters_redis_key,
+                    pickle.dumps(
+                        {
+                            "demand_points": demand_points,
+                            "demand_hulls": demand_hulls,
+                        }
+                    ),
+                )
+            self.logger.info("City data saved to Redis key=%s", redis_key)
+        except Exception as e:
+            self.logger.warning("Не удалось сохранить данные города в Redis: %s", e)
     
     # PATTERN: Observer — внешние подписчики регистрируются и получают события прогресса.
     # Почему: DataService не знает, кто слушатель; он лишь рассылает уведомления всем callbacks.
@@ -120,8 +253,14 @@ class DataService:
                 blob = self._redis.get(redis_key)
                 if blob:
                     base_data = pickle.loads(blob)
+                    base_data = self._ensure_cached_city_shape(
+                        base_data,
+                        normalized_name,
+                        network_type=network_type,
+                        simplify=simplify,
+                    )
                     # Проверяем, есть ли границы города в кэше
-                    if 'city_boundary' not in base_data:
+                    if base_data.get('city_boundary') is None:
                         self.logger.info("В Redis кэше нет границ города, перезагружаем данные")
                         # Удаляем из Redis и загружаем заново
                         self._redis.delete(redis_key)
@@ -187,7 +326,25 @@ class DataService:
             except Exception as e:
                 self.logger.warning(f"Ошибка чтения из Redis: {e}")
 
-        # Локальный диск как кэш больше не используется: при промахе в Redis загружаем данные заново
+        # Если Redis пустой, но рядом есть старый disk-cache (*.pkl), импортируем его в Redis.
+        # Это особенно важно для больших городов: после установки Redis не надо повторно грузить OSM.
+        if not force_refresh:
+            disk_data = self._load_from_disk_cache(
+                normalized_name,
+                network_type=network_type,
+                simplify=simplify,
+            )
+            if disk_data is not None:
+                disk_data = self.ensure_flight_levels(disk_data)
+                # Сначала сохраняем базовый город: это быстро и уже защищает от повторной OSM-загрузки.
+                self._save_city_cache_to_redis(redis_key, redis_clusters_key, disk_data)
+                # Затем досчитываем тяжёлые кластеры и дописываем отдельный Redis-ключ.
+                disk_data = self._ensure_demand_cache(disk_data, use_all_buildings=False)
+                self._save_city_cache_to_redis(redis_key, redis_clusters_key, disk_data)
+                self._update_progress("cache", 100, "Загрузка из disk-cache + сохранение в Redis")
+                return disk_data
+
+        # При полном промахе кэша загружаем данные заново и сохраняем в Redis.
         return self._download_city_data(
             normalized_name,
             redis_key=redis_key,

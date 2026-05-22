@@ -66,7 +66,7 @@ docker compose up --build
 ### 📋 Руководство по использованию
 
 #### 1. Загрузка данных города
-- Введите название города (например, "Балаково, Россия")
+- Введите название города (например, "Волгоград, Россия")
 - Нажмите "Загрузить" для загрузки данных OSM
 - Дождитесь построения графа
 
@@ -112,7 +112,7 @@ docker compose up --build
 ### 🌍 Поддерживаемые города
 
 Оптимизировано для российских городов с полной поддержкой геокодинга адресов:
-- Балаково (основной)
+- Волгоград (основной)
 - Москва
 - Санкт-Петербург
 - И многие другие...
@@ -199,7 +199,7 @@ docker compose up --build
 ### 📋 Usage Guide
 
 #### 1. Load City Data
-- Enter city name (e.g., "Balakovo, Russia")
+- Enter city name (e.g., "Volgograd, Russia")
 - Click "Загрузить" to load OSM data
 - Wait for graph construction
 
@@ -245,7 +245,7 @@ docker compose up --build
 ### 🌍 Supported Cities
 
 Optimized for Russian cities with full address geocoding support:
-- Balakovo (primary)
+- Volgograd (primary)
 - Moscow
 - St. Petersburg
 - And many more...
@@ -273,7 +273,7 @@ uvicorn api_server:app --reload
 
 ### 📊 Performance
 
-- **Graph Construction**: ~30s for Balakovo (may vary)
+- **Graph Construction**: ~30s for Volgograd (may vary)
 - **Route Planning**: <1s per route
 - **Simulation**: 1Hz tick rate
 - **Memory Usage**: ~200MB with city data

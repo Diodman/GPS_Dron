@@ -16,6 +16,7 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 from redis import Redis
+import numpy as np
 
 from city_data_service import DataService as CityDataService
 from data_service import DataService as InfraDataService
@@ -63,16 +64,23 @@ DEFAULT_SPEED_MPS = 12.0
 MAX_NEAREST_STATIONS = 8
 MAX_NEAREST_NETWORK_NODES = 12
 MAX_ROUTE_CANDIDATES = 20
+MAX_DRONE_ASSIGNMENT_CANDIDATES = 60
 # Strongly prefer infrastructure "air highways" (trunk/branch/voronoi) over off-network legs.
 # This makes routes mostly follow colored infrastructure lines between charging stations.
 OFF_NETWORK_PENALTY = 4.0
 # Short air-gap legs: start/end only to local|voronoi|branch nodes when infrastructure is nearby (m).
-OFF_NETWORK_MAX_ENTRY_EXIT_M = 500.0
-OFF_NETWORK_NEAR_INFRA_CONNECT_M = 500.0
+OFF_NETWORK_MAX_ENTRY_EXIT_M = 1200.0
+# Only snap rendered/telemetry segments to infrastructure when endpoints are
+# practically on the same infrastructure nodes. Pickup/dropoff legs may leave
+# highways and fly free, so a wide snap radius makes them look like highway hops.
+OFF_NETWORK_NEAR_INFRA_CONNECT_M = 80.0
 # Legacy cap for rare city_graph escape segments (not preferred infra routing).
 OFF_NETWORK_MAX_M = 3200.0
 ECHELON_CHANGE_PENALTY_M = 250.0
 OFF_NETWORK_LONG_PENALTY_M = 1400.0
+# If free flight is clearly shorter than following the infrastructure graph,
+# use it for pickup/dropoff legs. Cargo drones are allowed to leave airways.
+FREE_FLIGHT_PREFER_RATIO = 0.85
 # Scoring: off-network legs are expensive vs trunk (aligns with edge weight multipliers).
 OFF_NETWORK_LEG_WEIGHT_MULT = 8.0
 OFF_NETWORK_MAX_FRACTION_OF_TOTAL = 0.30
@@ -257,6 +265,9 @@ STATE: Dict[str, Any] = {
 	"last_infra_route_diagnostics": {},
 }
 
+_broadcast_task: Optional[asyncio.Task] = None
+_scheduler_task: Optional[asyncio.Task] = None
+
 # Helpers
 # Краткое описание погоды по коду WMO (Open-Meteo)
 def _weather_code_to_desc(code: int) -> str:
@@ -362,7 +373,8 @@ async def scheduler_loop():
 				)
 				logger.info("scheduler_tick orders_queued=%s drones_free=%s infra_ready=%s", queued, free, is_infrastructure_routing_ready())
 				last_tick_log = now
-			await assign_orders()
+			if is_infrastructure_routing_ready():
+				await assign_orders()
 			simulate_step()
 		except Exception:
 			logger.exception("scheduler_loop error")
@@ -373,8 +385,14 @@ async def scheduler_loop():
 			logger.exception("persist_state error")
 		await asyncio.sleep(1.0)
 
+async def delayed_scheduler_loop():
+	# Let ASGI startup finish and bind the HTTP socket before potentially heavy order planning.
+	await asyncio.sleep(1.0)
+	await scheduler_loop()
+
 @app.on_event("startup")
 async def on_startup():
+	global _broadcast_task, _scheduler_task
 	await restore_state()
 	# Попытка автозагрузки погоды на базе, чтобы UI не показывал только "ветер=по умолчанию".
 	try:
@@ -394,12 +412,20 @@ async def on_startup():
 		ensure_base_drones()
 	except Exception:
 		logger.exception("ensure_base_drones on startup failed")
-	asyncio.create_task(broadcaster_loop())
-	asyncio.create_task(scheduler_loop())
+	if _broadcast_task is None or _broadcast_task.done():
+		_broadcast_task = asyncio.create_task(broadcaster_loop())
+	if _scheduler_task is None or _scheduler_task.done():
+		_scheduler_task = asyncio.create_task(delayed_scheduler_loop())
 
 @app.on_event("shutdown")
 async def on_shutdown():
+	global _broadcast_task, _scheduler_task
 	await persist_state()
+	for task in (_broadcast_task, _scheduler_task):
+		if task and not task.done():
+			task.cancel()
+	_broadcast_task = None
+	_scheduler_task = None
 
 # API endpoints
 @app.post("/api/load_city")
@@ -420,8 +446,8 @@ async def load_city(body: LoadCityRequest):
 		STATE["drone_type"] = body.drone_type
 		# Ensure we have a base/inventory so drones exist even while infrastructure is building.
 		if not STATE.get("base"):
-			# Balakovo default (project-wide convention)
-			STATE["base"] = (52.0278, 47.8007)
+			# Volgograd default (project-wide convention)
+			STATE["base"] = (48.7080, 44.5133)
 		if not isinstance(STATE.get("inventory"), dict) or not STATE.get("inventory"):
 			STATE["inventory"] = {"cargo": 30, "operator": 10, "cleaner": 10}
 		# Build UAV infrastructure right after city load (anti-dup; may run in background)
@@ -825,8 +851,8 @@ async def fetch_weather(lat: Optional[float] = None, lon: Optional[float] = None
 		if base and len(base) == 2:
 			lat, lon = float(base[0]), float(base[1])
 		else:
-			# Default fallback: Balakovo
-			lat, lon = 52.0278, 47.8007
+			# Default fallback: Volgograd
+			lat, lon = 48.7080, 44.5133
 	data = await fetch_weather_from_api(lat, lon)
 	if data:
 		STATE["weather"] = data
@@ -1550,9 +1576,10 @@ def _validate_infra_route_quality(
 	tr_ratio = float(d.get("trunk_ratio") or 0.0)
 	tm = float(d.get("trunk_m") or 0.0)
 	start_end = float(d.get("start_end_m") or 0.0)
-	if total > 1e-6 and off_m / total > OFF_NETWORK_MAX_FRACTION_OF_TOTAL + 1e-9:
+	off_limit = 0.75 if start_end <= LONG_ROUTE_MIN_M else max(OFF_NETWORK_MAX_FRACTION_OF_TOTAL, 0.45)
+	if total > 1e-6 and off_m / total > off_limit + 1e-9:
 		return False, INFRA_ROUTE_SCORE_REJECT, "off_network_frac"
-	if prof.get("require_trunk_on_graph") and graph_has_trunk and tm < 1.0:
+	if prof.get("require_trunk_on_graph") and start_end > LONG_ROUTE_MIN_M and graph_has_trunk and tm < 1.0:
 		return False, INFRA_ROUTE_SCORE_REJECT, "no_trunk_while_graph_has_trunk"
 	if (
 		prof.get("require_long_route_trunk_ratio")
@@ -1908,6 +1935,20 @@ def _route_segments_from_coords(
 	return segments
 
 
+def _off_network_segments_from_coords(
+	coords: List[Tuple[float, float]],
+	*,
+	mode: str,
+) -> List[Dict[str, Any]]:
+	"""Build free-flight segments without snapping them back to infrastructure."""
+	out: List[Dict[str, Any]] = []
+	if not coords or len(coords) < 2:
+		return out
+	for i in range(1, len(coords)):
+		out.append(_route_segment_single(tuple(coords[i - 1]), tuple(coords[i]), mode=mode, layer="off_network", echelon=2))
+	return out
+
+
 def _infra_route_diagnostics_from_path(
 	infra_G: nx.Graph,
 	path_nodes: List[Any],
@@ -2035,7 +2076,7 @@ def plan_infrastructure_preferred_route(
 				return pn, co, ln, segs, diag
 			if ok_q and not _passes_long_leg_quality(diag):
 				dq = _enrich_route_diagnostics(dict(diag))
-				logger.info(
+				logger.debug(
 					"plan_infrastructure_preferred_route: strict rejected long_leg_quality drone_type=%s infra_ratio=%.3f off_ratio=%.3f need_infra>=%.2f off<=%.2f",
 					drone_type,
 					float(dq.get("infra_ratio") or 0.0),
@@ -2044,7 +2085,7 @@ def plan_infrastructure_preferred_route(
 					float(long_leg_max_off_network_ratio),
 				)
 			elif not ok_q:
-				logger.info(
+				logger.debug(
 					"plan_infrastructure_preferred_route: strict rejected drone_type=%s reason=%s trunk_ratio=%.3f infra_ratio=%.3f off%%=%.1f",
 					drone_type,
 					reason_q,
@@ -2750,14 +2791,14 @@ def _spawn_drones_from_infra_if_ready(*, force: bool = False) -> None:
 async def resolve_point(coords: Optional[List[float]], address: Optional[str]):
 	def _normalize_latlon_pair(pair: Tuple[float, float]) -> Tuple[float, float]:
 		lat, lon = float(pair[0]), float(pair[1])
-		# Heuristic: choose orientation closer to Balakovo center when city is Balakovo-like
+		# Heuristic: choose orientation closer to Volgograd center when city is Volgograd-like
 		city = (STATE.get("city") or "").lower()
-		if "balakovo" in city:
-			c0 = (52.0278, 47.8007)
+		if "volgograd" in city or "волгоград" in city:
+			c0 = (48.7080, 44.5133)
 			d1 = haversine_m((lat, lon), c0)
 			d2 = haversine_m((lon, lat), c0)
 			if d2 + 10.0 < d1:
-				logger.warning("coords look swapped for Balakovo: %s -> swapped", (lat, lon))
+				logger.warning("coords look swapped for Volgograd: %s -> swapped", (lat, lon))
 				return (lon, lat)
 		# Generic bounds swap: if lat outside [-90,90] but lon inside, swap
 		if abs(lat) > 90 and abs(lon) <= 90:
@@ -2929,6 +2970,210 @@ def _segment_intersects_no_fly_zone(a: Tuple[float, float], b: Tuple[float, floa
 	return False
 
 
+def _zone_detour_margin_deg(zone: Dict[str, Any], margin_m: float = 45.0) -> Tuple[float, float]:
+	try:
+		lat_mid = (float(zone["lat_min"]) + float(zone["lat_max"])) * 0.5
+	except Exception:
+		lat_mid = 0.0
+	lat_margin = float(margin_m) / 111_000.0
+	lon_margin = float(margin_m) / (111_000.0 * max(0.05, math.cos(math.radians(lat_mid))))
+	return lat_margin, lon_margin
+
+
+def _inflated_zone_corners(zone: Dict[str, Any], margin_m: float = 45.0) -> List[Tuple[float, float]]:
+	r = _rect_from_zone(zone)
+	if not r:
+		return []
+	lat_a, lat_b, lon_a, lon_b = r
+	lat_min, lat_max = min(lat_a, lat_b), max(lat_a, lat_b)
+	lon_min, lon_max = min(lon_a, lon_b), max(lon_a, lon_b)
+	dlat, dlon = _zone_detour_margin_deg(zone, margin_m=margin_m)
+	# Clockwise: NW, NE, SE, SW. Points are outside the real no-fly rectangle.
+	return [
+		(lat_max + dlat, lon_min - dlon),
+		(lat_max + dlat, lon_max + dlon),
+		(lat_min - dlat, lon_max + dlon),
+		(lat_min - dlat, lon_min - dlon),
+	]
+
+
+def _point_in_zone(point: Tuple[float, float], zone: Dict[str, Any]) -> bool:
+	r = _rect_from_zone(zone)
+	if not r:
+		return False
+	lat_a, lat_b, lon_a, lon_b = r
+	lat_min, lat_max = min(lat_a, lat_b), max(lat_a, lat_b)
+	lon_min, lon_max = min(lon_a, lon_b), max(lon_a, lon_b)
+	lat, lon = float(point[0]), float(point[1])
+	return lat_min <= lat <= lat_max and lon_min <= lon <= lon_max
+
+
+def _segment_intersects_zone(
+	a: Tuple[float, float],
+	b: Tuple[float, float],
+	zone: Dict[str, Any],
+	samples: int = 18,
+) -> bool:
+	if _point_in_zone(a, zone) or _point_in_zone(b, zone):
+		return True
+	for i in range(1, max(2, int(samples))):
+		t = i / float(samples)
+		p = (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+		if _point_in_zone(p, zone):
+			return True
+	return False
+
+
+def _first_zone_intersecting_segment(a: Tuple[float, float], b: Tuple[float, float]) -> Optional[Dict[str, Any]]:
+	for z in STATE.get("no_fly_zones") or []:
+		if not isinstance(z, dict):
+			continue
+		if _segment_intersects_zone(a, b, z, samples=18):
+			return z
+	return None
+
+
+def _path_crosses_no_fly(points: List[Tuple[float, float]]) -> bool:
+	if not points or len(points) < 2:
+		return False
+	for i in range(len(points) - 1):
+		if _segment_intersects_no_fly_zone(tuple(points[i]), tuple(points[i + 1]), samples=18):
+			return True
+	return False
+
+
+def _detour_segment_around_zone(
+	a: Tuple[float, float],
+	b: Tuple[float, float],
+	zone: Dict[str, Any],
+) -> Optional[List[Tuple[float, float]]]:
+	corners = _inflated_zone_corners(zone)
+	if len(corners) != 4:
+		return None
+	candidates: List[List[Tuple[float, float]]] = []
+	# Try one-corner shortcuts first, then arcs along the inflated rectangle.
+	for c in corners:
+		candidates.append([tuple(a), c, tuple(b)])
+	for i in range(4):
+		for j in range(4):
+			if i == j:
+				continue
+			if (i + 1) % 4 == j or (j + 1) % 4 == i:
+				candidates.append([tuple(a), corners[i], corners[j], tuple(b)])
+			else:
+				cw = [tuple(a), corners[i], corners[(i + 1) % 4], corners[j], tuple(b)]
+				ccw = [tuple(a), corners[i], corners[(i - 1) % 4], corners[j], tuple(b)]
+				candidates.extend([cw, ccw])
+	valid = [p for p in candidates if not _path_crosses_no_fly(p)]
+	if not valid:
+		return None
+	valid.sort(key=_route_length)
+	return valid[0]
+
+
+def _avoid_no_fly_in_coords(coords: List[Tuple[float, float]], max_passes: int = 4) -> List[Tuple[float, float]]:
+	"""Insert short off-network detour points around rectangular no-fly zones."""
+	out = _to_coord_list(coords)
+	if len(out) < 2 or not (STATE.get("no_fly_zones") or []):
+		return out
+	for _ in range(max(1, int(max_passes))):
+		changed = False
+		next_coords: List[Tuple[float, float]] = [out[0]]
+		for i in range(len(out) - 1):
+			a = tuple(out[i])
+			b = tuple(out[i + 1])
+			if _segment_intersects_no_fly_zone(a, b, samples=18):
+				z = _first_zone_intersecting_segment(a, b)
+				detour = _detour_segment_around_zone(a, b, z) if z else None
+				if detour and len(detour) > 2:
+					for p in detour[1:]:
+						if next_coords[-1] != p:
+							next_coords.append(p)
+					changed = True
+					continue
+			if next_coords[-1] != b:
+				next_coords.append(b)
+		out = next_coords
+		if not changed:
+			break
+	return out
+
+
+def _free_flight_path_between(
+	start: Tuple[float, float],
+	end: Tuple[float, float],
+	max_range_m: Optional[float] = None,
+) -> Tuple[List[Tuple[float, float]], float]:
+	"""Direct/free-flight path with no-fly detours, without snapping to infrastructure."""
+	coords = _avoid_no_fly_in_coords([tuple(start), tuple(end)])
+	if not coords or len(coords) < 2:
+		return [], 0.0
+	if _path_crosses_no_fly(coords):
+		return [], 0.0
+	length = float(_route_length(coords))
+	if max_range_m is not None and length > float(max_range_m):
+		return [], 0.0
+	return coords, length
+
+
+def _apply_no_fly_detours_to_result(result: Dict[str, Any], drone_type: str) -> Dict[str, Any]:
+	if not result or not result.get("ok") or not (STATE.get("no_fly_zones") or []):
+		return result
+	out = dict(result)
+	legs = out.get("segments")
+	if isinstance(legs, list) and legs:
+		new_legs = []
+		full: List[Tuple[float, float]] = []
+		pickup_count = out.get("pickup_waypoint_count")
+		for leg in legs:
+			leg2 = dict(leg or {})
+			coords = _to_coord_list(leg2.get("coords") or [])
+			if coords:
+				detoured = _avoid_no_fly_in_coords(coords)
+				leg2["coords"] = detoured
+				leg2["length"] = float(_route_length(detoured))
+				full = _concat_coords(full, detoured)
+				if leg2.get("type") == "to_pickup":
+					pickup_count = len(full)
+			new_legs.append(leg2)
+		if len(full) > 1:
+			out["segments"] = new_legs
+			out["coords"] = full
+			out["route_length"] = float(sum(float((l or {}).get("length") or 0.0) for l in new_legs))
+			out["route_segments"] = _route_segments_from_coords(full, mode=MODE_EMPTY, drone_type=drone_type)
+			if pickup_count is not None:
+				out["pickup_waypoint_count"] = int(pickup_count)
+			return out
+
+	coords = _to_coord_list(out.get("coords") or [])
+	if len(coords) > 1:
+		pickup_count = out.get("pickup_waypoint_count")
+		if isinstance(pickup_count, int) and 1 < pickup_count < len(coords):
+			to_pickup = _avoid_no_fly_in_coords(coords[:pickup_count])
+			after_pickup = _avoid_no_fly_in_coords([coords[pickup_count - 1]] + coords[pickup_count:])
+			full = _concat_coords(to_pickup, after_pickup)
+			out["pickup_waypoint_count"] = len(to_pickup)
+		else:
+			full = _avoid_no_fly_in_coords(coords)
+		out["coords"] = full
+		out["route_length"] = float(_route_length(full))
+		out["route_segments"] = _route_segments_from_coords(full, mode=MODE_EMPTY, drone_type=drone_type)
+	return out
+
+
+def _remaining_route_intersects_no_fly_zone(route: List[Tuple[float, float]], start_idx: int) -> bool:
+	if not route:
+		return False
+	idx = max(0, int(start_idx))
+	for i in range(idx, len(route) - 1):
+		try:
+			if _segment_intersects_no_fly_zone(tuple(route[i]), tuple(route[i + 1])):
+				return True
+		except Exception:
+			continue
+	return False
+
+
 def _build_operator_area_flight_path(start_pos: Tuple[float, float], polygon: List[Tuple[float, float]], waypoints: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
 	"""
 	Маршрут осмотра operator-area в координатах полёта (без road graph):
@@ -2936,6 +3181,13 @@ def _build_operator_area_flight_path(start_pos: Tuple[float, float], polygon: Li
 	"""
 	if not waypoints:
 		return []
+	waypoints = [tuple(w) for w in waypoints if isinstance(w, (list, tuple)) and len(w) == 2]
+	if len(waypoints) > 1:
+		try:
+			if haversine_m(tuple(start_pos), tuple(waypoints[-1])) < haversine_m(tuple(start_pos), tuple(waypoints[0])):
+				waypoints = list(reversed(waypoints))
+		except Exception:
+			pass
 	coords: List[Tuple[float, float]] = []
 	prev = tuple(start_pos)
 	for wp in waypoints:
@@ -2999,6 +3251,15 @@ def _build_operator_area_route(
 	entry = tuple(area_path[0])
 	_, approach_coords_raw, approach_len = plan_route_for(tuple(drone_pos), entry, drone_type, battery_pct, reserve_pct=PLAN_RESERVE_PCT)
 	approach_coords = _to_coord_list(approach_coords_raw or [tuple(drone_pos)])
+	max_approach_m = _routing_service.max_reachable_distance(battery_pct, MODE_EMPTY, drone_type, reserve_pct=PLAN_RESERVE_PCT)
+	free_approach_coords, free_approach_len = _free_flight_path_between(tuple(drone_pos), entry, max_approach_m)
+	if free_approach_coords and (
+		not approach_coords
+		or len(approach_coords) < 2
+		or free_approach_len <= float(approach_len or 0.0) * FREE_FLIGHT_PREFER_RATIO
+	):
+		approach_coords = free_approach_coords
+		approach_len = free_approach_len
 	if not approach_coords:
 		approach_coords = [tuple(drone_pos)]
 	approach_last = tuple(approach_coords[-1])
@@ -3063,18 +3324,23 @@ def _to_coord_list(coords: List[Any]) -> List[Tuple[float, float]]:
 
 
 def _best_escape_graph_path(start: Tuple[float, float], battery_pct: float, drone_type: str = "operator") -> Tuple[List[Tuple[float, float]], float]:
-	"""Графовый выход до ближайшей зарядки: base/station."""
+	"""Выход до ближайшей зарядки: free-flight can beat graph if it is clearly shorter."""
 	chargers: List[Tuple[float, float]] = []
 	if STATE.get("base"):
 		chargers.append(tuple(STATE["base"]))
 	chargers += [tuple(s) for s in STATE.get("stations", []) if isinstance(s, (list, tuple)) and len(s) == 2]
 	best_coords: List[Tuple[float, float]] = []
 	best_len = float("inf")
+	max_escape_m = _routing_service.max_reachable_distance(battery_pct, MODE_EMPTY, drone_type, reserve_pct=PLAN_RESERVE_PCT)
 	for c in chargers:
 		_, coords, length = plan_route_for(tuple(start), tuple(c), drone_type, battery_pct, reserve_pct=PLAN_RESERVE_PCT)
 		if coords and length < best_len:
 			best_len = float(length)
 			best_coords = _to_coord_list(coords)
+		free_coords, free_len = _free_flight_path_between(tuple(start), tuple(c), max_escape_m)
+		if free_coords and (not best_coords or free_len <= best_len * FREE_FLIGHT_PREFER_RATIO):
+			best_len = float(free_len)
+			best_coords = free_coords
 	if best_coords:
 		return (best_coords, best_len)
 	return ([], 0.0)
@@ -3198,6 +3464,28 @@ def _sanitize_active_drone_state(drone_id: str, drone: Dict[str, Any]) -> None:
 	если есть active_order и непустой route, дрон не должен оставаться idle/holding.
 	"""
 	order = _get_active_order_for_drone(drone_id)
+	if drone.get("active_order_id") and not order:
+		try:
+			_remove_drone_from_charge_queues(drone_id)
+		except Exception:
+			pass
+		for key in (
+			"active_order_id",
+			"saved_order_id",
+			"saved_target_idx",
+			"loaded_after_waypoint_count",
+			"waypoints_completed",
+			"force_charge_after_route",
+		):
+			drone.pop(key, None)
+		drone["route"] = []
+		drone["route_segments"] = []
+		drone["resume_route"] = []
+		drone["resume_route_segments"] = []
+		drone["target_idx"] = 0
+		if drone.get("status") != "charging":
+			drone["status"] = "idle"
+		return
 	route = drone.get("route") or []
 	idx = int(drone.get("target_idx", 0))
 	if order and route and idx < len(route) and drone.get("status") in ("idle", "holding"):
@@ -3449,7 +3737,10 @@ async def assign_orders():
 	if not city or G is None:
 		return
 	queue = [o for o in STATE["orders"] if o.get("status") == "queued"]
-	logger.info("assign_orders start queued=%s", len(queue))
+	if queue:
+		logger.info("assign_orders start queued=%s", len(queue))
+	else:
+		logger.debug("assign_orders start queued=0")
 	# Сортируем по приоритету (убывание), при равном — по порядку в списке (FIFO)
 	order_indices = {o.get("id"): i for i, o in enumerate(STATE["orders"])}
 	queue = sorted(queue, key=lambda o: (-o.get("priority", 0), order_indices.get(o.get("id"), 0)))
@@ -3463,8 +3754,13 @@ async def assign_orders():
 		continuation = None
 		# Грузовой: три фазы (забор → доставка → зарядка). Операторский/сервисный: точка или область.
 		if required_type == "cargo":
-			result = plan_order_trip(
-				drone["pos"], order["start"], order["end"], drone["type"], drone["battery"]
+			result = await asyncio.to_thread(
+				plan_order_trip,
+				drone["pos"],
+				order["start"],
+				order["end"],
+				drone["type"],
+				drone["battery"],
 			)
 		elif required_type == "operator" and (order.get("remaining_waypoints") or (order.get("handover_point") and order.get("rest_waypoints"))):
 			tmp_order = dict(order)
@@ -3472,7 +3768,7 @@ async def assign_orders():
 			handover = order.get("handover_point")
 			if handover and (not remaining or tuple(remaining[0]) != tuple(handover)):
 				tmp_order["remaining_waypoints"] = [tuple(handover)] + [tuple(w) for w in remaining]
-			result, continuation = plan_operator_area_trip(drone, tmp_order)
+			result, continuation = await asyncio.to_thread(plan_operator_area_trip, drone, tmp_order)
 			if result and result.get("ok") and continuation and not any(o.get("id") == continuation.get("id") for o in STATE.get("orders", [])):
 				# Многошаговая передача area-задачи: каждый этап может создать следующий continuation.
 				STATE["orders"].append(continuation)
@@ -3486,7 +3782,7 @@ async def assign_orders():
 				order["area_waypoints"] = [tuple(w) for w in _operator_area_waypoints(order)]
 			if not order.get("remaining_waypoints"):
 				order["remaining_waypoints"] = list(order.get("area_waypoints") or [])
-			result, continuation = plan_operator_area_trip(drone, order)
+			result, continuation = await asyncio.to_thread(plan_operator_area_trip, drone, order)
 			if result and result.get("ok") and continuation and not any(o.get("id") == continuation.get("id") for o in STATE.get("orders", [])):
 				STATE["orders"].append(continuation)
 				order["continuation_spawned"] = True
@@ -3496,8 +3792,12 @@ async def assign_orders():
 				result = result or {"ok": False, "reason": "NO_PATH", "details": "operator area plan failed"}
 		else:
 			# Операторская точка или сервисный: дрон → точка → зарядка (отдельное планирование)
-			result = plan_operator_point_trip(
-				drone["pos"], order["end"], drone["type"], drone["battery"]
+			result = await asyncio.to_thread(
+				plan_operator_point_trip,
+				drone["pos"],
+				order["end"],
+				drone["type"],
+				drone["battery"],
 			)
 		if not result.get("ok"):
 			logger.info(
@@ -3505,6 +3805,7 @@ async def assign_orders():
 				order.get("id"), drone_id, result.get("reason"), result.get("details")
 			)
 			continue
+		result = _apply_no_fly_detours_to_result(result, str(drone.get("type") or required_type))
 		full_coords = result.get("coords") or []
 		segs = result.get("route_segments") or []
 		route_len = float(result.get("route_length") or 0.0)
@@ -3653,6 +3954,7 @@ def estimate_order_completion_time_seconds(drone: Dict[str, Any], order: Dict[st
 	result = _run_plan_for_order(pos, battery, order, required_type)
 	if not result or not result.get("ok"):
 		return (float("inf"), None)
+	result = _apply_no_fly_detours_to_result(result, required_type)
 	return (_order_completion_time_seconds(result), result)
 
 
@@ -3667,26 +3969,95 @@ def estimate_new_drone_completion_time_seconds(order: Dict[str, Any], required_t
 	result = _run_plan_for_order(base, 100.0, order, required_type)
 	if not result or not result.get("ok"):
 		return (float("inf"), None)
+	result = _apply_no_fly_detours_to_result(result, required_type)
 	return (_order_completion_time_seconds(result), result)
 
 
-def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Optional[str]:
-	"""Выбор дрона с минимальным ETA (полёт + зарядки по пути + выполнение заказа)."""
-	order_start = order.get("handover_point")
-	if not order_start and order.get("remaining_waypoints"):
-		order_start = (order.get("remaining_waypoints") or [None])[0]
-	if not order_start:
-		order_start = order.get("start") or order.get("end")
-	if not order_start:
-		return None
-	order_start = tuple(order_start) if isinstance(order_start, (list, tuple)) and len(order_start) == 2 else None
-	if not order_start:
-		return None
+def _operator_area_assignment_targets(order: Dict[str, Any]) -> List[Tuple[float, float]]:
+	"""Points that represent where an operator area mission should be picked up."""
+	targets: List[Tuple[float, float]] = []
+	for key in ("handover_point",):
+		p = order.get(key)
+		if isinstance(p, (list, tuple)) and len(p) == 2:
+			targets.append((float(p[0]), float(p[1])))
+	for p in order.get("remaining_waypoints") or []:
+		if isinstance(p, (list, tuple)) and len(p) == 2:
+			targets.append((float(p[0]), float(p[1])))
+	for p in order.get("area_waypoints") or []:
+		if isinstance(p, (list, tuple)) and len(p) == 2:
+			targets.append((float(p[0]), float(p[1])))
+	for p in order.get("area_polygon") or []:
+		if isinstance(p, (list, tuple)) and len(p) == 2:
+			targets.append((float(p[0]), float(p[1])))
+	if order.get("area_polygon") and not targets:
+		for p in _operator_area_waypoints(order):
+			targets.append((float(p[0]), float(p[1])))
+	if targets:
+		try:
+			targets.append(_centroid(targets))
+		except Exception:
+			pass
+	return targets
 
+
+def _assignment_distance_to_order(
+	order: Dict[str, Any],
+	pos: Tuple[float, float],
+	required_type: str,
+) -> Tuple[float, Tuple[float, float]]:
+	"""Distance used only for selecting the nearest suitable drone."""
+	targets: List[Tuple[float, float]] = []
+	if required_type == "operator" and (order.get("area_polygon") or order.get("remaining_waypoints")):
+		targets = _operator_area_assignment_targets(order)
+	elif required_type in ("operator", "cleaner"):
+		# Point operator/service jobs are performed at destination. When the UI
+		# does not provide "from", add_order fills start with base for validity;
+		# that must not make us choose the drone nearest to base.
+		end = order.get("end")
+		if isinstance(end, (list, tuple)) and len(end) == 2:
+			targets = [(float(end[0]), float(end[1]))]
+	if not targets:
+		order_start = order.get("handover_point")
+		if not order_start and order.get("remaining_waypoints"):
+			order_start = (order.get("remaining_waypoints") or [None])[0]
+		if not order_start:
+			order_start = order.get("start") or order.get("end")
+		if isinstance(order_start, (list, tuple)) and len(order_start) == 2:
+			targets = [(float(order_start[0]), float(order_start[1]))]
+	if not targets:
+		return float("inf"), tuple(pos)
+	best = min(targets, key=lambda p: haversine_m(tuple(pos), tuple(p)))
+	return float(haversine_m(tuple(pos), tuple(best))), tuple(best)
+
+
+def _station_type_for_drone(drone: Dict[str, Any]) -> Optional[str]:
+	"""Best-effort station type for an already spawned drone."""
+	for key in ("current_station_type", "home_station_type"):
+		val = drone.get(key)
+		if val:
+			return str(val)
+	infra = STATE.get("infrastructure") or {}
+	stations = infra.get("charging_stations") or []
+	ids = [drone.get("current_station_id"), drone.get("home_station_id")]
+	for sid in ids:
+		if not sid:
+			continue
+		sid_s = str(sid)
+		for st in stations:
+			if str((st or {}).get("id")) == sid_s:
+				stype = (st or {}).get("station_type")
+				return str(stype) if stype else None
+	return None
+
+
+def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Optional[str]:
+	"""Выбор ближайшего свободного дрона к стартовой/передаточной точке заказа."""
 	best_drone_id = None
+	best_distance = float("inf")
 	best_time = float("inf")
 	debug_rows = []
 
+	idle_candidates = []
 	for drone_id, d in STATE["drones"].items():
 		if d.get("type") != required_drone_type:
 			continue
@@ -3695,7 +4066,15 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 		if not d.get("pos"):
 			continue
 		pos = tuple(d.get("pos"))
-		dd = haversine_m(pos, tuple(order_start))
+		dd, target_for_debug = _assignment_distance_to_order(order, pos, required_drone_type)
+		if not math.isfinite(dd):
+			continue
+		idle_candidates.append((float(dd), drone_id, d, pos, target_for_debug))
+
+	idle_candidates.sort(key=lambda x: x[0])
+	idle_candidates = idle_candidates[:MAX_DRONE_ASSIGNMENT_CANDIDATES]
+
+	for dd, drone_id, d, pos, target_for_debug in idle_candidates:
 		time_sec, res = estimate_order_completion_time_seconds(d, order, required_drone_type)
 		route_len = float(res.get("route_length", 0.0)) if res else 0.0
 		valid = (time_sec != float("inf") and route_len > 1.0)
@@ -3703,16 +4082,18 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 		debug_rows.append({
 			"drone_id": drone_id,
 			"drone_pos": pos,
-			"pickup": tuple(order_start),
+			"pickup": tuple(target_for_debug),
 			"distance_direct_m": float(dd),
 			"route_len_m": float(route_len),
 			"eta_s": float(time_sec) if time_sec != float("inf") else None,
 			"valid": bool(valid),
 			"reason": reason,
 		})
-		if valid and time_sec < best_time:
+		if valid:
+			best_distance = float(dd)
 			best_time = time_sec
 			best_drone_id = drone_id
+			break
 
 	# Для continuation/handover задач не спавним новый дрон автоматически:
 	# если свободных нет — заказ ждёт в очереди.
@@ -3725,16 +4106,17 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 	has_inventory = (inv.get(required_drone_type, 0) or 0) > 0
 	time_new = float("inf")
 	if has_inventory:
-		time_new, _ = estimate_new_drone_completion_time_seconds(order, required_drone_type)
-		existing_best = best_time
-		if time_new < best_time:
-			new_id = spawn_drone_from_inventory(required_drone_type, order_id=str(order.get("id")), caller="pick_drone_for_order")
-			if new_id:
-				logger.info(
-					"pick_drone_for_order: order=%s -> new drone %s (ETA %.0fs < existing best %.0fs)",
-					order.get("id"), new_id, time_new, existing_best,
-				)
-				return new_id
+		if best_drone_id is None:
+			time_new, _ = estimate_new_drone_completion_time_seconds(order, required_drone_type)
+			existing_best = best_time
+			if time_new < best_time:
+				new_id = spawn_drone_from_inventory(required_drone_type, order_id=str(order.get("id")), caller="pick_drone_for_order")
+				if new_id:
+					logger.info(
+						"pick_drone_for_order: order=%s -> new drone %s (ETA %.0fs < existing best %.0fs)",
+						order.get("id"), new_id, time_new, existing_best,
+					)
+					return new_id
 
 	STATE["last_route_debug"] = {
 		"ts": datetime.utcnow().isoformat(),
@@ -3746,8 +4128,8 @@ def pick_drone_for_order(order: Dict[str, Any], required_drone_type: str) -> Opt
 
 	if best_drone_id is not None:
 		logger.info(
-			"pick_drone_for_order: order=%s -> drone %s (ETA %.0fs, new_from_base=%.0fs)",
-			order.get("id"), best_drone_id, best_time, time_new if has_inventory else float("inf"),
+			"pick_drone_for_order: order=%s -> nearest drone %s (distance %.0fm, ETA %.0fs, new_from_base=%.0fs)",
+			order.get("id"), best_drone_id, best_distance, best_time, time_new if has_inventory else float("inf"),
 		)
 		return best_drone_id
 	return None
@@ -3783,12 +4165,16 @@ def plan_route_for(
 			start, end, drone_type, mode="empty", prefer_network=True
 		)
 		if coords_infra and len(coords_infra) > 1 and float(length_infra) > 1.0 and segs:
+			coords_infra = _avoid_no_fly_in_coords(_to_coord_list(coords_infra))
+			length_infra = _route_length(coords_infra)
 			logger.info("plan_route_for: mode=%s len=%.1f pts=%s", "infra_route", float(length_infra), len(coords_infra))
 			return None, coords_infra, float(length_infra)
 
 	# 2) City door-to-door fallback (MUST use city_graph, never infra_graph).
 	path, coords, length = _routing_service.plan_direct_path(city_G, start, end, max_range, waypoints=waypoints)
 	if path and coords and len(coords) > 1 and float(length) > 1.0:
+		coords = _avoid_no_fly_in_coords(_to_coord_list(coords))
+		length = _route_length(coords)
 		logger.info("plan_route_for: mode=%s len=%.1f pts=%s", "city_fallback", float(length), len(coords))
 		return path, coords, length
 
@@ -3801,7 +4187,9 @@ def plan_route_for(
 	if not path:
 		return None, None, 0.0
 	coords = [city_G.nodes[n]['pos'] for n in path]
+	coords = _avoid_no_fly_in_coords(_to_coord_list(coords))
 	length = _routing_service._calculate_path_length(city_G, path)
+	length = _route_length(coords)
 	if coords and len(coords) > 1 and float(length) > 1.0:
 		logger.info("plan_route_for: mode=%s len=%.1f pts=%s", "city_fallback", float(length), len(coords))
 	return path, coords, length
@@ -3970,12 +4358,42 @@ def plan_order_trip(
 				_pa, ca, la = _routing_service.plan_direct_path(G, start_c, end_c, max_m)
 				if not ca or len(ca) < 2 or float(la) <= 1.0:
 					return None, 0.0, [], {}, "city_direct_unavailable"
-				coords_list = [tuple(float(p[0]), float(p[1])) for p in ca]
+				coords_list = [(float(p[0]), float(p[1])) for p in ca]
 				segs = _route_segments_from_coords(coords_list, mode=seg_mode, drone_type=drone_type)
 				diag = _enrich_route_diagnostics(
 					_infra_route_diagnostics_from_segments(segs, start_end_m=float(haversine_m(tuple(start_c), tuple(end_c))))
 				)
 				return coords_list, float(la), segs, diag, "city_direct"
+
+			def _free_flight_leg(
+				start_c: Tuple[float, float],
+				end_c: Tuple[float, float],
+				max_m: float,
+				seg_mode: str,
+			) -> Tuple[Optional[List[Tuple[float, float]]], float, List[Dict[str, Any]], Dict[str, Any], str]:
+				coords_list, length_m = _free_flight_path_between(tuple(start_c), tuple(end_c), max_m)
+				if not coords_list or len(coords_list) < 2:
+					return None, 0.0, [], {}, "free_flight_unavailable"
+				if length_m <= 1.0:
+					return None, 0.0, [], {}, "free_flight_range"
+				segs = _off_network_segments_from_coords(coords_list, mode=seg_mode)
+				diag = _enrich_route_diagnostics(
+					_infra_route_diagnostics_from_segments(segs, start_end_m=float(haversine_m(tuple(start_c), tuple(end_c))))
+				)
+				diag["free_flight"] = True
+				return coords_list, length_m, segs, diag, "free_flight"
+
+			def _use_free_over_network(
+				free_coords: Optional[List[Tuple[float, float]]],
+				free_len: float,
+				network_coords: Optional[List[Tuple[float, float]]],
+				network_len: float,
+			) -> bool:
+				if not free_coords or len(free_coords) < 2 or float(free_len) <= 1.0:
+					return False
+				if not network_coords or len(network_coords) < 2 or float(network_len) <= 1.0:
+					return True
+				return float(free_len) <= float(network_len) * FREE_FLIGHT_PREFER_RATIO
 
 			max_a = _routing_service.max_reachable_distance(battery_pct, MODE_EMPTY, drone_type, reserve_pct=plan_reserve)
 			_p1, c1, l1, s1, d1 = plan_infrastructure_preferred_route(
@@ -3983,7 +4401,13 @@ def plan_order_trip(
 			)
 			fb1 = False
 			fb1_reason = ""
-			if not (c1 and len(c1) > 1 and s1 and float(l1) > 1.0 and float(l1) <= float(max_a)):
+			free_c1, free_l1, free_s1, free_d1, free_r1 = _free_flight_leg(drone_pos, pickup, max_a, MODE_EMPTY)
+			infra1_ok = bool(c1 and len(c1) > 1 and s1 and float(l1) > 1.0 and float(l1) <= float(max_a))
+			if _use_free_over_network(free_c1, free_l1, c1 if infra1_ok else None, l1):
+				c1, l1, s1, d1, fb1_reason = free_c1, free_l1, free_s1, free_d1, free_r1
+				fb1 = True
+				_p1 = None
+			elif not infra1_ok:
 				c1, l1, s1, d1, fb1_reason = _city_leg_direct(drone_pos, pickup, max_a, MODE_EMPTY)
 				fb1 = bool(c1)
 				_p1 = None
@@ -3999,7 +4423,13 @@ def plan_order_trip(
 			)
 			fb2 = False
 			fb2_reason = ""
-			if not (c2 and len(c2) > 1 and s2 and float(l2) > 1.0 and float(l2) <= float(max_b)):
+			free_c2, free_l2, free_s2, free_d2, free_r2 = _free_flight_leg(pickup, dropoff, max_b, MODE_LOADED)
+			infra2_ok = bool(c2 and len(c2) > 1 and s2 and float(l2) > 1.0 and float(l2) <= float(max_b))
+			if _use_free_over_network(free_c2, free_l2, c2 if infra2_ok else None, l2):
+				c2, l2, s2, d2, fb2_reason = free_c2, free_l2, free_s2, free_d2, free_r2
+				fb2 = True
+				_p2 = None
+			elif not infra2_ok:
 				c2, l2, s2, d2, fb2_reason = _city_leg_direct(pickup, dropoff, max_b, MODE_LOADED)
 				fb2 = bool(c2)
 				_p2 = None
@@ -4076,7 +4506,7 @@ def plan_order_trip(
 					len_c = float(best_len_c)
 					chargers_used = list(ch_c or [])
 					segs_c = _route_segments_from_coords(
-						[tuple(float(p[0]), float(p[1])) for p in coords_c], mode=MODE_EMPTY, drone_type=drone_type
+						[(float(p[0]), float(p[1])) for p in coords_c], mode=MODE_EMPTY, drone_type=drone_type
 					)
 					d3 = _enrich_route_diagnostics(
 						_infra_route_diagnostics_from_segments(segs_c, start_end_m=float(haversine_m(tuple(dropoff), tuple(coords_c[-1]))))
@@ -4472,6 +4902,15 @@ def simulate_step():
 			if drone.get("battery", 100.0) <= FLY_TO_CHARGER_AT_PCT:
 				maybe_route_to_base_or_station(drone)
 			continue
+		try:
+			zone_version = int(STATE.get("zone_version", 0) or 0)
+			seen_zone_version = int(drone.get("_zone_version_seen", zone_version) or 0)
+			if zone_version != seen_zone_version and _remaining_route_intersects_no_fly_zone(route, max(0, idx - 1)):
+				if _replan_active_route_for_zones(drone_id, drone):
+					continue
+				drone["_zone_version_seen"] = zone_version
+		except Exception:
+			pass
 		current = drone["pos"]
 		target = route[idx]
 		# Periodic movement debug (throttled per drone)
@@ -4507,13 +4946,12 @@ def simulate_step():
 			pass
 		# Для operator_area миссии не перепрокладываем через road graph:
 		# там маршрут уже задан внутренними координатами зоны осмотра.
-		if is_point_in_any_zone(target) and drone.get("mission_mode") != "operator_area":
+		if (
+			(is_point_in_any_zone(target) or _segment_intersects_no_fly_zone(tuple(current), tuple(target)))
+			and drone.get("mission_mode") != "operator_area"
+		):
 			# attempt reroute
-			end = route[-1]
-			_, coords, _ = plan_via_base_if_needed(current, end, drone["type"], drone["battery"])
-			if coords:
-				drone["route"] = coords
-				drone["target_idx"] = 0
+			if _replan_active_route_for_zones(drone_id, drone):
 				continue
 			else:
 				drone["status"] = "holding"
@@ -4530,8 +4968,10 @@ def simulate_step():
 			# Arrive this tick
 			drone["pos"] = target
 			at_charger = is_at_any_station(target) or (STATE.get("base") and haversine_m(target, tuple(STATE["base"])) < STATION_NEAR_METERS)
-			# Если прилетели на зарядку и впереди ещё точки — останавливаемся на зарядку, потом продолжаем маршрут
-			if at_charger and idx + 1 < len(route):
+			charging_route_status = drone.get("status") in ("return_charge", "return_base", "low_battery")
+			# Останавливаемся на промежуточной зарядке только когда дрон явно летит на зарядку.
+			# В обычных заказах станции часто являются узлами инфраструктуры, их надо проходить транзитом.
+			if at_charger and idx + 1 < len(route) and charging_route_status:
 				drone["resume_route"] = list(route[idx + 1:])
 				drone["route"] = list(route[: idx + 1])
 				drone["target_idx"] = idx + 1
@@ -4631,11 +5071,9 @@ def _avoidance_step(drone_id: str, drone: Dict[str, Any]) -> None:
 
 
 def will_collide(drone_id: str, next_pos: Tuple[float,float]) -> bool:
-	for other_id, other in STATE["drones"].items():
-		if other_id == drone_id:
-			continue
-		if haversine_m(next_pos, other.get("pos", next_pos)) < 8.0:  # 8 meters bubble
-			return True
+	# Separation is represented by route layers/echelons in this simulation.
+	# A nearby drone must not create a fake obstacle: it caused endless
+	# "avoidance" loops when drones met on infrastructure nodes or stations.
 	return False
 
 
@@ -4826,6 +5264,7 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 			)
 		return False
 
+	res = _apply_no_fly_detours_to_result(res, str(drone.get("type") or order.get("drone_type") or "cargo"))
 	drone["route"] = list(res["coords"])
 	drone["route_segments"] = list(
 		res.get("route_segments")
@@ -4843,6 +5282,72 @@ def _restore_route_after_charging(drone: Dict[str, Any]) -> bool:
 	drone.pop("saved_order_id", None)
 	logger.info("_restore_route_after_charging: replanned route for order %s (%s waypoints)", order_id, len(drone["route"]))
 	return True
+
+
+def _apply_replanned_route(drone_id: str, drone: Dict[str, Any], order: Dict[str, Any], res: Dict[str, Any]) -> bool:
+	if not res or not res.get("ok") or not res.get("coords"):
+		return False
+	res = _apply_no_fly_detours_to_result(res, str(drone.get("type") or order.get("drone_type") or "cargo"))
+	coords = _to_coord_list(res.get("coords") or [])
+	if not coords:
+		return False
+	drone["route"] = coords
+	drone["route_segments"] = list(
+		res.get("route_segments")
+		or _route_segments_from_coords(coords, mode="empty", drone_type=str(drone.get("type") or "cargo"))
+	)
+	drone["resume_route"] = []
+	drone["resume_route_segments"] = []
+	cur = drone.get("pos")
+	start_idx = 0
+	try:
+		if cur and len(coords) > 1 and haversine_m(tuple(cur), tuple(coords[0])) < 3.0:
+			start_idx = 1
+	except Exception:
+		start_idx = 0
+	drone["target_idx"] = start_idx
+	drone["status"] = "enroute"
+	drone["active_order_id"] = order.get("id")
+	if res.get("route_diagnostics"):
+		drone["route_diagnostics"] = dict(res["route_diagnostics"])
+	else:
+		drone.pop("route_diagnostics", None)
+	return True
+
+
+def _replan_active_route_for_zones(drone_id: str, drone: Dict[str, Any]) -> bool:
+	order = _get_active_order_for_drone(drone_id)
+	if not order:
+		return False
+	try:
+		required_type = order.get("drone_type") or map_order_to_drone_type(order.get("type", "delivery"))
+		pos = tuple(drone.get("pos", (0.0, 0.0)))
+		battery = float(drone.get("battery", 100.0))
+		if required_type == "cargo":
+			if _is_drone_loaded(drone):
+				res = plan_order_trip(pos, pos, tuple(order["end"]), "cargo", battery)
+				if res and res.get("ok"):
+					res["pickup_waypoint_count"] = 0
+			else:
+				res = plan_order_trip(pos, tuple(order["start"]), tuple(order["end"]), "cargo", battery)
+		elif required_type == "operator" and (order.get("remaining_waypoints") or (order.get("handover_point") and order.get("rest_waypoints"))):
+			res = plan_operator_continuation_trip({"pos": pos, "battery": battery, "type": "operator"}, order)
+		elif required_type == "operator" and order.get("area_polygon"):
+			res, _cont = plan_operator_area_trip({"pos": pos, "battery": battery, "type": "operator"}, order)
+		elif required_type == "operator":
+			res = plan_operator_point_trip(pos, tuple(order["end"]), "operator", battery)
+		elif required_type == "cleaner":
+			res = plan_operator_point_trip(pos, tuple(order["end"]), "cleaner", battery)
+		else:
+			return False
+	except Exception:
+		logger.exception("_replan_active_route_for_zones: failed drone=%s", drone_id)
+		return False
+	if _apply_replanned_route(drone_id, drone, order, res):
+		drone["_zone_version_seen"] = STATE.get("zone_version", 0)
+		logger.info("_replan_active_route_for_zones: drone=%s order=%s route_len=%.1f", drone_id, order.get("id"), float(res.get("route_length", 0.0)))
+		return True
+	return False
 
 
 def _has_assigned_order_for_drone(drone_id: str) -> bool:
@@ -5257,11 +5762,11 @@ def ensure_base_drones():
 					n_cargo, n_operator, n_cleaner = _split_capacity(cap_i)
 
 				for _ in range(n_cargo):
-					spawn_drone("cargo", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id)
+					spawn_drone("cargo", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id, home_station_type=st.get("station_type"), current_station_type=st.get("station_type"))
 				for _ in range(n_operator):
-					spawn_drone("operator", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id)
+					spawn_drone("operator", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id, home_station_type=st.get("station_type"), current_station_type=st.get("station_type"))
 				for _ in range(n_cleaner):
-					spawn_drone("cleaner", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id)
+					spawn_drone("cleaner", pos=tuple(pos), battery=100.0, home_station_id=st_id, current_station_id=st_id, home_station_type=st.get("station_type"), current_station_type=st.get("station_type"))
 			except Exception:
 				continue
 		return
@@ -5302,6 +5807,8 @@ def spawn_drone(
 	battery: float = 100.0,
 	home_station_id: Optional[str] = None,
 	current_station_id: Optional[str] = None,
+	home_station_type: Optional[str] = None,
+	current_station_type: Optional[str] = None,
 ) -> str:
 	did = _next_drone_id(drone_type)
 	STATE["drones"][did] = {
@@ -5313,6 +5820,8 @@ def spawn_drone(
 		"status": "idle",
 		"home_station_id": home_station_id,
 		"current_station_id": current_station_id,
+		"home_station_type": home_station_type,
+		"current_station_type": current_station_type,
 		"current_echelon": None,
 	}
 	return did
@@ -5344,7 +5853,8 @@ def spawn_drone_from_inventory(pref_type: str, order_id: Optional[str] = None, c
     )
     return did
 
-# Split a full route into two: up to first charger (station/base), then remainder to resume after charging
+# Assign a full route. Charging is handled by simulate_step only at the final charger
+# or when the drone is explicitly routed to charge because of low battery.
 def apply_midroute_charging(
 	drone: Dict[str, Any],
 	full_coords: List[Tuple[float, float]],
@@ -5360,40 +5870,23 @@ def apply_midroute_charging(
             drone["target_idx"] = 0
             drone["status"] = "enroute" if full_coords else "idle"
             return
-        base = STATE.get("base")
-        split_idx = None
-        for i in range(1, len(full_coords)):
-            pt = tuple(full_coords[i])
-            at_station = is_at_any_station(pt)
-            at_base = bool(base) and haversine_m(pt, tuple(base)) < STATION_NEAR_METERS
-            if at_station or at_base:
-                if i < len(full_coords) - 1:
-                    split_idx = i
-                    break
-        if split_idx is not None:
-            drone["route"] = list(full_coords[:split_idx+1])
-            drone["resume_route"] = list(full_coords[split_idx+1:])
-            if full_segments:
-                drone["route_segments"] = list(full_segments[:split_idx])
-                drone["resume_route_segments"] = list(full_segments[split_idx:])
-            else:
-                drone["route_segments"] = _route_segments_from_coords(drone["route"], mode="empty", drone_type=_dt_seg)
-                drone["resume_route_segments"] = _route_segments_from_coords(
-                    drone["resume_route"], mode="empty", drone_type=_dt_seg
-                )
-            drone["target_idx"] = 0
-            drone["status"] = "enroute"
-        else:
-            drone["route"] = list(full_coords)
-            drone["resume_route"] = []
-            drone["route_segments"] = (
-                list(full_segments)
-                if full_segments
-                else _route_segments_from_coords(drone["route"], mode="empty", drone_type=_dt_seg)
-            )
-            drone["resume_route_segments"] = []
-            drone["target_idx"] = 0
-            drone["status"] = "enroute"
+        drone["route"] = list(full_coords)
+        drone["resume_route"] = []
+        drone["route_segments"] = (
+            list(full_segments)
+            if full_segments
+            else _route_segments_from_coords(drone["route"], mode="empty", drone_type=_dt_seg)
+        )
+        drone["resume_route_segments"] = []
+        cur = drone.get("pos")
+        start_idx = 0
+        try:
+            if cur and len(drone["route"]) > 1 and haversine_m(tuple(cur), tuple(drone["route"][0])) < 3.0:
+                start_idx = 1
+        except Exception:
+            start_idx = 0
+        drone["target_idx"] = start_idx
+        drone["status"] = "enroute"
     except Exception:
         drone["route"] = list(full_coords or [])
         drone["resume_route"] = []
@@ -5415,12 +5908,13 @@ async def persist_state():
     try:
         data = {
             "city": STATE.get("city"),
-            "orders": STATE.get("orders", []),
+            # Orders are runtime-only. Persisting them causes old queued jobs to
+            # resurrect after restart and spam routing warnings.
+            "orders": [],
             "drones": STATE.get("drones", {}),
             "no_fly_zones": STATE.get("no_fly_zones", []),
             "weather": STATE.get("weather", {}),
             "base": STATE.get("base"),
-            "inventory": STATE.get("inventory", {}),
             "stations": STATE.get("stations", []),
             "station_queues": STATE.get("station_queues", {}),
             "battery_mode": STATE.get("battery_mode", "reality"),
@@ -5440,12 +5934,12 @@ async def restore_state():
             return
         data = json.loads(raw)
         STATE["city"] = data.get("city")
-        STATE["orders"] = data.get("orders", [])
+        # Do not restore orders from Redis; they are intentionally runtime-only.
+        STATE["orders"] = []
         STATE["drones"] = data.get("drones", {})
         STATE["no_fly_zones"] = data.get("no_fly_zones", [])
         STATE["weather"] = data.get("weather", {"wind_mps": 3.0})
         STATE["base"] = tuple(data.get("base")) if data.get("base") else None
-        STATE["inventory"] = data.get("inventory", {})
         STATE["stations"] = data.get("stations", [])
         if data.get("station_queues"):
             sq = data["station_queues"]
@@ -5501,12 +5995,12 @@ def normalize_latlon(coord: Any, *, ctx: str = "") -> Optional[Tuple[float, floa
 		else:
 			return None
 		city = (STATE.get("city") or "").lower()
-		if "balakovo" in city:
-			c0 = (52.0278, 47.8007)
+		if "volgograd" in city or "волгоград" in city:
+			c0 = (48.7080, 44.5133)
 			d1 = haversine_m((lat, lon), c0)
 			d2 = haversine_m((lon, lat), c0)
 			if d2 + 10.0 < d1:
-				logger.warning("normalize_latlon: swapped for Balakovo ctx=%s in=%s out=%s", ctx, (lat, lon), (lon, lat))
+				logger.warning("normalize_latlon: swapped for Volgograd ctx=%s in=%s out=%s", ctx, (lat, lon), (lon, lat))
 				return (lon, lat)
 		if abs(lat) > 90 and abs(lon) <= 90:
 			logger.warning("normalize_latlon: lat out of range ctx=%s in=%s out=%s", ctx, (lat, lon), (lon, lat))
