@@ -559,6 +559,7 @@
                 <div id="kpiOrders">0</div>
             </div>
         </div>
+        <div class="muted" id="infraStatus" style="margin:8px 0 12px 0">Инфраструктура: —</div>
 		<hr />
         <h4>🎯 Дроны</h4>
         <div id="drones"></div>
@@ -591,9 +592,9 @@
         <!-- Грузовой: откуда, куда, промежуточные точки -->
         <div id="orderFormCargo" class="order-form-block">
             <label>📍 Откуда (широта, долгота или адрес)</label>
-            <input id="from" placeholder="48.7, 44.5 или адрес" />
+            <input id="from" placeholder="48.7080, 44.5133 или адрес" />
             <label>📍 Куда (широта, долгота или адрес)</label>
-            <input id="to" placeholder="48.7, 44.6 или адрес" />
+            <input id="to" placeholder="48.7080, 44.5133 или адрес" />
             <div class="row">
                 <button type="button" onclick="useClick('from')">📍 Откуда</button>
                 <button type="button" onclick="useClick('to')">📍 Куда</button>
@@ -618,7 +619,7 @@
             </div>
             <div id="operatorPointBlock">
                 <label>📍 Точка назначения (широта, долгота или адрес)</label>
-                <input id="operatorPoint" placeholder="48.7, 44.6 или адрес" />
+                <input id="operatorPoint" placeholder="48.7080, 44.5133 или адрес" />
                 <button type="button" onclick="useClick('operatorPoint')">📍 Указать на карте</button>
             </div>
             <div id="operatorAreaBlock" style="display:none">
@@ -631,7 +632,7 @@
         <!-- Сервисный: только финальная точка -->
         <div id="orderFormService" class="order-form-block" style="display:none">
             <label>📍 Финальная точка (широта, долгота или адрес)</label>
-            <input id="toService" placeholder="48.7, 44.6 или адрес" />
+            <input id="toService" placeholder="48.7080, 44.5133 или адрес" />
             <button type="button" onclick="useClick('toService')">📍 Указать на карте</button>
         </div>
 
@@ -668,11 +669,12 @@
             <button onclick="clearStations()">🗑️ Очистить</button>
         </div>
         <label>📍 Массовое добавление (по одной координате в строке: lat, lon)</label>
-        <textarea id="stationsBulk" rows="3" placeholder="48.700000, 44.500000&#10;48.710000, 44.520000"></textarea>
+        <textarea id="stationsBulk" rows="3" placeholder="48.708000, 44.513300&#10;48.710000, 44.518000"></textarea>
         <button onclick="bulkAddStations()">➕ Добавить станции</button>
         <h4>🌆 Город</h4>
-		<input id="city" value="Volgograd, Russia" />
+		<input id="city" value="Волгоград, Россия" />
         <button onclick="loadCity()">🗺️ Загрузить</button>
+        <div class="muted" id="cityStatus" style="margin-top:8px;">Город: Волгоград, Россия</div>
 	</div>
 	<div id="rightPanel">
         <div class="section battery-mode-panel">
@@ -702,7 +704,10 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 let map = L.map('map').setView([48.7080, 44.5133], 12);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+L.tileLayer('https://tile.openstreetmap.de/{z}/{x}/{y}.png', {
+	maxZoom: 19,
+	attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+}).addTo(map);
 let droneMarkers = {};
 let zoneLayers = [];
 let routeLayers = [];
@@ -711,6 +716,176 @@ let currentPick = null;
 let changeDestOrderId = null;
 let stationMarkers = [];
 let stations = [];
+let infraVersion = 0;
+let infraGeo = null;
+let infraLoading = false;
+
+// Infrastructure Leaflet layers (toggleable)
+const infraLayerGroups = {
+    chargingA: L.layerGroup(),
+    chargingB: L.layerGroup(),
+    maintenance: L.layerGroup(),
+    garages: L.layerGroup(),
+    trunk: L.layerGroup(),
+    branch: L.layerGroup(),
+    voronoi: L.layerGroup(),
+    clusterHulls: L.layerGroup(),
+    droneRoutes: L.layerGroup(),
+    droneEchelons: L.layerGroup(),
+    freeDrones: L.layerGroup(),
+};
+// Default visible layers (avoid map chaos)
+infraLayerGroups.chargingA.addTo(map);
+infraLayerGroups.chargingB.addTo(map);
+infraLayerGroups.clusterHulls.addTo(map);
+infraLayerGroups.droneRoutes.addTo(map);
+infraLayerGroups.droneEchelons.addTo(map);
+
+L.control.layers(
+    {},
+    {
+        "⚡ Charging A": infraLayerGroups.chargingA,
+        "⚡ Charging B": infraLayerGroups.chargingB,
+        "🛠 ТО": infraLayerGroups.maintenance,
+        "🏠 Garages": infraLayerGroups.garages,
+        "🛣 Trunk paths": infraLayerGroups.trunk,
+        "🪢 Branch paths": infraLayerGroups.branch,
+        "🕸 Local Voronoi paths": infraLayerGroups.voronoi,
+        "🧩 Cluster hulls": infraLayerGroups.clusterHulls,
+        "🧭 Drone routes": infraLayerGroups.droneRoutes,
+        "⬆ Drone echelon markers": infraLayerGroups.droneEchelons,
+        "🟦 Free drones": infraLayerGroups.freeDrones,
+    },
+    { collapsed: false }
+).addTo(map);
+
+function clearLayerGroup(g){
+    try { g.clearLayers(); } catch(e) {}
+}
+
+function styleLine(color, weight=3, opacity=0.8){
+    return { color, weight, opacity };
+}
+
+function styleHull(){
+    return { color:'#8b5cf6', weight:2, opacity:0.9, fillOpacity:0.08, fillColor:'#8b5cf6' };
+}
+
+function addGeoJsonToGroup(group, fc, opts){
+    if (!fc || fc.type !== 'FeatureCollection' || !Array.isArray(fc.features)) return;
+    L.geoJSON(fc, opts || {}).addTo(group);
+}
+
+async function fetchInfrastructure(){
+    try {
+        infraLoading = true;
+        const st = document.getElementById('infraStatus');
+        if (st) st.textContent = 'Инфраструктура: строится...';
+        const r = await fetch('/api/infrastructure/geojson');
+        const j = await r.json();
+        if (j && j.ok && j.geojson){
+            infraGeo = j.geojson;
+            infraVersion = j.version || infraVersion;
+            renderInfrastructureLayers(infraGeo);
+            function fcLen(fc){ return (fc && fc.type==='FeatureCollection' && Array.isArray(fc.features)) ? fc.features.length : 0; }
+            let voroEchelon = 0;
+            if (infraGeo.voronoi_edges_by_echelon && typeof infraGeo.voronoi_edges_by_echelon === 'object'){
+                for (const k of Object.keys(infraGeo.voronoi_edges_by_echelon)){
+                    voroEchelon += fcLen(infraGeo.voronoi_edges_by_echelon[k]);
+                }
+            }
+            const voroFlat = fcLen(infraGeo.voronoi_edges);
+            const hasVoronoiPaths = voroFlat > 0 || voroEchelon > 0;
+            console.info('[infrastructure geojson] layers:', {
+                trunk: fcLen(infraGeo.trunk),
+                branch_edges: fcLen(infraGeo.branch_edges),
+                local_edges: fcLen(infraGeo.local_edges),
+                voronoi_edges: voroFlat,
+                voronoi_edges_by_echelon_total: voroEchelon,
+                charging_type_a: fcLen(infraGeo.charging_type_a),
+                charging_type_b: fcLen(infraGeo.charging_type_b),
+                voronoi_paths_present: hasVoronoiPaths,
+            });
+            infraLoading = false;
+            if (st) st.textContent = `Инфраструктура: готово (v${infraVersion})`;
+        } else {
+            infraLoading = false;
+            if (st) st.textContent = 'Инфраструктура: строится...';
+        }
+    } catch(e) {
+        infraLoading = false;
+        const st = document.getElementById('infraStatus');
+        if (st) st.textContent = 'Инфраструктура: ошибка загрузки';
+        console.warn('fetchInfrastructure failed', e);
+    }
+}
+
+function renderInfrastructureLayers(geo){
+    // clear
+    Object.values(infraLayerGroups).forEach(clearLayerGroup);
+    if (!geo) return;
+
+    function limitFC(fc, n){
+        if (!fc || fc.type !== 'FeatureCollection') return fc;
+        const feats = Array.isArray(fc.features) ? fc.features : [];
+        if (feats.length <= n) return fc;
+        return { type:'FeatureCollection', features: feats.slice(0, n) };
+    }
+
+    // Stations (visual cap only; do NOT affect backend pipeline)
+    const MAX_STATIONS_RENDER = 250;
+    addGeoJsonToGroup(infraLayerGroups.chargingA, limitFC(geo.charging_type_a, MAX_STATIONS_RENDER), {
+        pointToLayer: (f, latlng)=> L.circleMarker(latlng, {radius:4, color:'#10b981', weight:1, fillOpacity:0.65, fillColor:'#10b981'}),
+        onEachFeature: (f, layer)=>{
+            const p = (f.properties||{});
+            const cap = p.cluster_drones_total != null ? p.cluster_drones_total : (p.cluster_drones_capacity != null ? p.cluster_drones_capacity : '—');
+            const cargo = p.cluster_drones_cargo ?? '—';
+            const op = p.cluster_drones_monitoring ?? '—';
+            const srv = p.cluster_drones_service ?? '—';
+            layer.bindTooltip(`⚡ Charge A • дроны: ${cap} (груз ${cargo}, оп ${op}, серв ${srv}) • cluster: ${p.cluster_id ?? '—'}`);
+        }
+    });
+    addGeoJsonToGroup(infraLayerGroups.chargingB, limitFC(geo.charging_type_b, MAX_STATIONS_RENDER), {
+        pointToLayer: (f, latlng)=> L.circleMarker(latlng, {radius:5, color:'#22c55e', weight:1, fillOpacity:0.6, fillColor:'#22c55e'}),
+        onEachFeature: (f, layer)=>{
+            const p = (f.properties||{});
+            const cap = p.cluster_drones_total != null ? p.cluster_drones_total : (p.cluster_drones_capacity != null ? p.cluster_drones_capacity : '—');
+            const cargo = p.cluster_drones_cargo ?? '—';
+            const op = p.cluster_drones_monitoring ?? '—';
+            const srv = p.cluster_drones_service ?? '—';
+            layer.bindTooltip(`⚡ Charge B • дроны: ${cap} (груз ${cargo}, оп ${op}, серв ${srv}) • cluster: ${p.cluster_id ?? '—'}`);
+        }
+    });
+
+    addGeoJsonToGroup(infraLayerGroups.maintenance, geo.to_stations, {
+        pointToLayer: (f, latlng)=> L.circleMarker(latlng, {radius:5, color:'#f59e0b', weight:2, fillOpacity:0.7, fillColor:'#f59e0b'}),
+        onEachFeature: (f, layer)=> layer.bindTooltip('🛠 ТО')
+    });
+    addGeoJsonToGroup(infraLayerGroups.garages, geo.garages, {
+        pointToLayer: (f, latlng)=> L.circleMarker(latlng, {radius:5, color:'#0ea5e9', weight:2, fillOpacity:0.7, fillColor:'#0ea5e9'}),
+        onEachFeature: (f, layer)=> layer.bindTooltip('🏠 Garage')
+    });
+
+    // Paths
+    addGeoJsonToGroup(infraLayerGroups.trunk, geo.trunk, { style: styleLine('#ef4444', 4, 0.85) });
+    addGeoJsonToGroup(infraLayerGroups.branch, geo.branch_edges, { style: styleLine('#f97316', 3, 0.8) });
+    // Prefer per-echelon voronoi if present
+    if (geo.voronoi_edges_by_echelon){
+        const colors = { '1':'#60a5fa', '2':'#3b82f6', '3':'#1d4ed8' };
+        for (const k of Object.keys(geo.voronoi_edges_by_echelon)){
+            addGeoJsonToGroup(infraLayerGroups.voronoi, geo.voronoi_edges_by_echelon[k], { style: styleLine(colors[k]||'#3b82f6', 2, 0.75) });
+        }
+    } else {
+        addGeoJsonToGroup(infraLayerGroups.voronoi, geo.voronoi_edges, { style: styleLine('#3b82f6', 2, 0.75) });
+    }
+
+    // Cluster hulls (outlined polygons)
+    addGeoJsonToGroup(infraLayerGroups.clusterHulls, geo.cluster_hulls, { style: styleHull() });
+}
+
+function infraReady(){
+    return infraVersion > 0 && infraGeo && Object.keys(infraGeo||{}).length > 0;
+}
 let pushStationsTimer = null;
 let operatorAreaBounds = null;
 let operatorAreaPolygon = null;
@@ -785,11 +960,18 @@ ws.onmessage = ev => {
     window.lastHistories = s.histories || {};
     updateDrones(s.drones||{});
     drawZones(s.no_fly_zones||[]);
-    // update stations from server truth and состояние аккумуляторов
-    stations = s.stations || [];
-    window.stationStates = s.station_states || [];
-    drawStations();
-    updateStationCountsUI();
+    // legacy stations: show only when infra is not ready
+    if (!infraReady()){
+        stations = s.stations || [];
+        window.stationStates = s.station_states || [];
+        drawStations();
+        updateStationCountsUI();
+    } else {
+        // clear legacy markers to avoid duplicates
+        stations = [];
+        stationMarkers.forEach(m=> map.removeLayer(m));
+        stationMarkers = [];
+    }
     // populate base input if empty and server sends base
     if (s.base && (!document.getElementById('base').value || document.getElementById('base').value.trim()==='')){
         const [lat, lon] = s.base; document.getElementById('base').value = `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
@@ -798,6 +980,15 @@ ws.onmessage = ev => {
     document.getElementById('kpiDrones').textContent = Object.keys(s.drones||{}).length;
     document.getElementById('kpiOrders').textContent = (s.orders||[]).length;
     updateWeatherUI(s.weather);
+
+    // Infrastructure reload on version bump (keeps WS light)
+    const v = s.infrastructure_version || 0;
+    const st = document.getElementById('infraStatus');
+    if (st && !v) st.textContent = 'Инфраструктура: строится...';
+    if (v && v !== infraVersion){
+        infraVersion = v;
+        fetchInfrastructure();
+    }
 };
 	ws.onclose = ()=> setTimeout(connectWS, 1000);
 }
@@ -869,6 +1060,9 @@ function updateDrones(drones){
 	// do not reset arrays drastically; remove previous polylines
 	Object.values(routeLayers).forEach(l=> map.removeLayer(l));
 	routeLayers = [];
+	clearLayerGroup(infraLayerGroups.droneRoutes);
+	clearLayerGroup(infraLayerGroups.droneEchelons);
+    clearLayerGroup(infraLayerGroups.freeDrones);
     Object.values(historyLayers).forEach(l=> map.removeLayer(l));
     historyLayers = {};
 	const list = document.getElementById('drones');
@@ -876,6 +1070,8 @@ function updateDrones(drones){
 	list.innerHTML='';
     const palette = ['#4285F4','#EA4335','#FBBC05','#34A853','#9C27B0','#FF9800','#795548','#607D8B'];
     const ids = Object.keys(drones);
+    const MAX_FREE_DRONES = 1000;
+    let freeShown = 0;
     for (let idx=0; idx<ids.length; idx++){
         const id = ids[idx];
         const d = drones[id];
@@ -883,15 +1079,68 @@ function updateDrones(drones){
         const iconHtml = droneIconHtml(d.type, color);
         const icon = L.divIcon({className:'drone-icon', html: iconHtml});
         const droneDisplayName = id.startsWith('drone_') ? (droneTypeRu(d.type) + (id.replace('drone_','')||'1')) : id;
-        if (!droneMarkers[id]){
-            droneMarkers[id] = L.marker(d.pos,{icon}).addTo(map).bindPopup(droneDisplayName);
-        }else{
+        const isFree = !d.status || d.status === 'idle';
+        const isActive = !isFree;
+        // Active drones always visible. Free drones: only when layer enabled and capped.
+        let showMarker = isActive;
+        if (isFree){
+            if (map.hasLayer(infraLayerGroups.freeDrones) && freeShown < MAX_FREE_DRONES){
+                showMarker = true;
+                freeShown += 1;
+            }
+        }
+        if (showMarker){
+            if (!droneMarkers[id]){
+                droneMarkers[id] = L.marker(d.pos,{icon}).bindPopup(droneDisplayName);
+            }
             droneMarkers[id].setLatLng(d.pos);
             droneMarkers[id].setIcon(icon);
-            droneMarkers[id].setPopupContent(droneDisplayName);
+            let popupHtml = droneDisplayName;
+            const rdPop = d.route_diagnostics;
+            if (rdPop && typeof rdPop === 'object'){
+                const rstyle = routeStyleLabelRu(d.type);
+                if (rstyle){
+                    popupHtml += `<div style="font-size:12px;opacity:.85;margin-top:4px">Тип маршрута: ${rstyle}</div>`;
+                }
+            }
+            if (rdPop && (rdPop.trunk_pct != null || rdPop.off_network_pct != null)){
+                const trp = rdPop.trunk_pct != null ? Math.round(Number(rdPop.trunk_pct)) : '—';
+                const lvp = rdPop.local_voronoi_pct != null ? Math.round(Number(rdPop.local_voronoi_pct)) : '—';
+                const ofp = rdPop.off_network_pct != null ? Math.round(Number(rdPop.off_network_pct)) : '—';
+                popupHtml += `<div style="font-size:12px;opacity:.85;margin-top:4px">Магистраль ${trp}% · локальн. ${lvp}% · off ${ofp}%</div>`;
+            }
+            droneMarkers[id].setPopupContent(popupHtml);
+            if (isFree){
+                infraLayerGroups.freeDrones.addLayer(droneMarkers[id]);
+            } else {
+                droneMarkers[id].addTo(map);
+            }
+        } else {
+            if (droneMarkers[id] && map.hasLayer(droneMarkers[id])) map.removeLayer(droneMarkers[id]);
         }
-        if (d.route && d.route.length){
-            const poly = L.polyline(d.route, {color}).addTo(map);
+        // Prefer segment-based rendering (layer + echelon)
+        if (Array.isArray(d.route_segments) && d.route_segments.length){
+            const layerColors = {
+                'local':'#2563eb',
+                'voronoi':'#38bdf8',
+                'branch':'#f97316',
+                'trunk':'#b91c1c',
+                'off_network':'#94a3b8'
+            };
+            for (const seg of d.route_segments){
+                if (!seg || !seg.from || !seg.to) continue;
+                const lay = (seg.layer||'off_network');
+                const col = layerColors[lay] || color;
+                const w = lay === 'trunk' ? 6 : (lay === 'branch' ? 4 : (lay === 'off_network' ? 2 : 3));
+                const dash = lay === 'off_network' ? '6 6' : null;
+                const poly = L.polyline([seg.from, seg.to], {color: col, weight: w, opacity: 0.9, dashArray: dash || undefined});
+                poly.addTo(infraLayerGroups.droneRoutes);
+                poly.bindTooltip(`${lay} • L${seg.echelon ?? '—'} • ${Math.round(seg.length_m||0)} м • ${seg.mode||''}`, { sticky: true });
+                routeLayers.push(poly);
+            }
+        } else if (d.route && d.route.length){
+            const poly = L.polyline(d.route, {color});
+            poly.addTo(infraLayerGroups.droneRoutes);
 			routeLayers.push(poly);
 		}
         if (window.lastHistories && window.lastHistories[id] && window.lastHistories[id].length >= 2){
@@ -905,11 +1154,33 @@ function updateDrones(drones){
         const bat = d.battery!=null?`${d.battery.toFixed(0)}%`:'-';
         const lq = d.link_quality!=null?qualityPill(d.link_quality):'';
         const toStreet = (d.route && d.target_idx!=null && d.route[d.target_idx]) ? d.route[d.target_idx] : null;
+        let routeDiagLine = '';
+        const rd = d.route_diagnostics;
+        if (rd && typeof rd === 'object'){
+            const rstyle = routeStyleLabelRu(d.type);
+            if (rstyle){
+                routeDiagLine += `<br><span class="muted">Тип маршрута: ${rstyle}</span>`;
+            }
+        }
+        if (rd && (rd.trunk_pct != null || rd.off_network_pct != null)){
+            const tr = rd.trunk_pct != null ? Math.round(Number(rd.trunk_pct)) : '—';
+            const lv = rd.local_voronoi_pct != null ? Math.round(Number(rd.local_voronoi_pct)) : '—';
+            const off = rd.off_network_pct != null ? Math.round(Number(rd.off_network_pct)) : '—';
+            routeDiagLine += `<br><span class="muted">Магистраль ${tr}% · локальн./Voronoi ${lv}% · off_network ${off}%</span>`;
+        }
         item.innerHTML = `<b>${displayName}</b> • ${ruStatus(d.status)||'-'} ${lq}<br>`+
-            `Заряд: ${bat} • Осталось: ${eta}` + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
+            `Заряд: ${bat} • Осталось: ${eta}` + (d.current_echelon!=null?` • Эшелон: <b>${d.current_echelon}</b>`:'') + routeDiagLine + (toStreet?`<br><span class="muted" id="street_${id}">Определение улицы...</span>`:'');
         item.onclick = ()=> focusDrone(id);
 		list.appendChild(item);
         if (toStreet){ fetchStreet(toStreet, id); }
+
+        // Echelon marker near drone (if server provides)
+        if (d.current_echelon != null){
+            const lab = L.marker(d.pos, {
+                icon: L.divIcon({className:'echelon-label', html:`<div style="background:rgba(15,23,42,.9);color:#fff;padding:2px 6px;border-radius:8px;font-size:11px;border:1px solid rgba(255,255,255,.25)">L${d.current_echelon}</div>`})
+            });
+            lab.addTo(infraLayerGroups.droneEchelons);
+        }
 	}
 	// keep scroll stable
 	list.scrollTop = Math.min(prevTop, list.scrollHeight - (prevHeight - prevTop));
@@ -926,6 +1197,12 @@ function drawZones(zones){
 }
 
 function drawStations(){
+    if (infraReady()) {
+        // do not draw legacy stations when infra layers exist
+        stationMarkers.forEach(m=> map.removeLayer(m));
+        stationMarkers = [];
+        return;
+    }
     stationMarkers.forEach(m=> map.removeLayer(m));
     stationMarkers = [];
     const states = window.stationStates || [];
@@ -955,8 +1232,79 @@ function updateStationCountsUI(){
 }
 
 async function loadCity(){
-	const city = document.getElementById('city').value;
-	await fetch('/api/load_city', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({city})});
+    const statusEl = document.getElementById('cityStatus');
+    const infraEl = document.getElementById('infraStatus');
+	const city = (document.getElementById('city').value || '').trim();
+    if (!city){
+        if (statusEl) statusEl.textContent = 'Город: не задан (введите название и нажмите «Загрузить»)';
+        return;
+    }
+    if (statusEl) statusEl.textContent = 'Город: загрузка графа...';
+    if (infraEl) infraEl.textContent = 'Инфраструктура: —';
+    try{
+        const r = await fetch('/api/load_city', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({city})
+        });
+        const j = await r.json().catch(()=> ({}));
+        if (!r.ok || !j || j.ok === false){
+            const err = (j && j.error) ? j.error : `HTTP ${r.status}`;
+            if (statusEl) statusEl.textContent = `Город: ошибка загрузки (${err})`;
+            if (infraEl) infraEl.textContent = 'Инфраструктура: —';
+            return;
+        }
+        if (statusEl) statusEl.textContent = 'Город: граф загружен, строим инфраструктуру...';
+        // infrastructure build happens asynchronously after /api/load_city; poll a lightweight status endpoint
+        pollInfrastructureBuildStatus();
+    }catch(e){
+        if (statusEl) statusEl.textContent = 'Город: ошибка загрузки (см. консоль)';
+        console.warn('loadCity failed', e);
+    }
+}
+
+let infraPollTimer = null;
+async function pollInfrastructureBuildStatus(){
+    const infraEl = document.getElementById('infraStatus');
+    const statusEl = document.getElementById('cityStatus');
+    if (infraPollTimer) { clearInterval(infraPollTimer); infraPollTimer = null; }
+    let tries = 0;
+    // immediate tick
+    const tick = async ()=>{
+        tries++;
+        try{
+            const r = await fetch('/api/infrastructure');
+            const j = await r.json();
+            const st = (j && j.build_status) ? j.build_status : null;
+            const lastErr = (j && j.last_error) ? j.last_error : null;
+            const v = (j && j.version) ? j.version : 0;
+            if (st === 'ready' && v){
+                if (infraEl) infraEl.textContent = `Инфраструктура: готово (v${v})`;
+                if (statusEl) statusEl.textContent = 'Город: готово';
+                clearInterval(infraPollTimer); infraPollTimer = null;
+                // load geojson layers
+                infraVersion = v;
+                fetchInfrastructure();
+                return;
+            }
+            if (st === 'error'){
+                if (infraEl) infraEl.textContent = 'Инфраструктура: ошибка построения';
+                if (statusEl) statusEl.textContent = `Город: инфраструктура не построена (${lastErr || 'ошибка'})`;
+                clearInterval(infraPollTimer); infraPollTimer = null;
+                return;
+            }
+            // building/idle/unknown
+            if (infraEl) infraEl.textContent = 'Инфраструктура: строится...';
+        }catch(e){
+            if (infraEl) infraEl.textContent = 'Инфраструктура: ошибка статуса';
+        }
+        if (tries >= 60){
+            clearInterval(infraPollTimer); infraPollTimer = null;
+            if (infraEl) infraEl.textContent = 'Инфраструктура: строится... (долго)';
+        }
+    };
+    await tick();
+    infraPollTimer = setInterval(tick, 2000);
 }
 
 function parseMaybeCoords(s){
@@ -1191,6 +1539,13 @@ function ruStatus(s){
 function droneTypeRu(t){
     return ({ 'cargo':'грузовой', 'operator':'операторский', 'cleaner':'сервисный' })[t]||t||'—';
 }
+function routeStyleLabelRu(t){
+    const x = String(t||'').toLowerCase();
+    if (x === 'cargo') return 'магистральный';
+    if (x === 'operator') return 'гибридный';
+    if (x === 'cleaner') return 'локальный';
+    return '';
+}
 
 function focusDrone(id){
     const m = droneMarkers[id];
@@ -1224,8 +1579,8 @@ async function saveBase(){
     await fetch('/api/base', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({base: bc, inventory: inv})});
 }
 
-// Автозагрузка города при старте (для удобства)
-window.addEventListener('load', ()=>{ loadCity(); updateOrderFormByDroneType(); });
+// Не автозагружаем город: тяжёлая операция. Пользователь запускает явно кнопкой «Загрузить».
+window.addEventListener('load', ()=>{ updateOrderFormByDroneType(); });
 // Load base, stations and weather on startup to populate UI quickly
 window.addEventListener('load', async ()=>{
     try{
@@ -1242,6 +1597,29 @@ window.addEventListener('load', async ()=>{
         const s = await fetch('/api/state').then(x=>x.json());
         if (s.weather) updateWeatherUI(s.weather);
         if (s.station_states) { window.stationStates = s.station_states; updateStationCountsUI(); }
+        const cs = document.getElementById('cityStatus');
+        if (cs) cs.textContent = s.city ? `Город: ${s.city}` : 'Город: —';
+        const st = document.getElementById('infraStatus');
+        if (s.infrastructure_version){
+            infraVersion = s.infrastructure_version;
+            fetchInfrastructure();
+        } else {
+            if (st) st.textContent = 'Инфраструктура: строится...';
+            // Poll until infra becomes available (build may run in background after /api/load_city)
+            let tries = 0;
+            const timer = setInterval(async ()=>{
+                tries++;
+                try{
+                    const ss = await fetch('/api/state').then(x=>x.json());
+                    if (ss.infrastructure_version){
+                        infraVersion = ss.infrastructure_version;
+                        clearInterval(timer);
+                        fetchInfrastructure();
+                    }
+                }catch(e){}
+                if (tries >= 20) clearInterval(timer);
+            }, 2000);
+        }
     }catch(e){}
 });
 </script>

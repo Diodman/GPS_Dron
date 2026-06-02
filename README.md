@@ -98,7 +98,7 @@ docker compose up --build
 
 #### Основные сервисы
 - **`api_server.py`**: FastAPI сервер с поддержкой WebSocket
-- **`data_service.py`**: Загрузка данных OSM и геокодинг
+- **`city_data_service.py`**: Загрузка данных OSM и геокодинг
 - **`graph_service.py`**: Построение графа города с бесполётными зонами
 - **`routing_service.py`**: Алгоритмы поиска пути и оптимизация
 
@@ -231,7 +231,7 @@ docker compose up --build
 
 #### Core Services
 - **`api_server.py`**: FastAPI server with WebSocket support
-- **`data_service.py`**: OSM data loading and geocoding
+- **`city_data_service.py`**: OSM data loading and geocoding
 - **`graph_service.py`**: City graph construction with no-fly zones
 - **`routing_service.py`**: Pathfinding algorithms and optimization
 
@@ -273,7 +273,7 @@ uvicorn api_server:app --reload
 
 ### 📊 Performance
 
-- **Graph Construction**: ~30s for Volgograd
+- **Graph Construction**: ~30s for Volgograd (may vary)
 - **Route Planning**: <1s per route
 - **Simulation**: 1Hz tick rate
 - **Memory Usage**: ~200MB with city data
